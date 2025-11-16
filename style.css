@@ -69,6 +69,14 @@ html, body {
   background: #3b58ff;
 }
 
+.controls button#setSeed {
+  background: #1e74ff;
+}
+
+.controls button#setSeed:hover {
+  background: #1656c2;
+}
+
 .controls button#randomSeed:hover {
   background: #2c41bf;
 }

@@ -50,6 +50,7 @@ canvas.height = CANVAS_HEIGHT;
 const seedInput = document.getElementById("seedInput");
 const newGameBtn = document.getElementById("newGame");
 const randomSeedBtn = document.getElementById("randomSeed");
+const setSeedBtn = document.getElementById("setSeed");
 const specialButton = document.getElementById("specialButton");
 const timerEl = document.getElementById("timer");
 const coinsEl = document.getElementById("coins");
@@ -96,9 +97,7 @@ const state = {
 };
 let padPulseTimer = 0;
 
-const initialSeedParam = new URLSearchParams(window.location.search).get("seed");
-const initialSeed = initialSeedParam || Math.floor(Math.random() * 1e9).toString();
-seedInput.value = initialSeed;
+seedInput.value = Math.floor(Math.random() * 1e9).toString();
 setupListeners();
 showMainMenu();
 let lastFrame = performance.now();
@@ -109,6 +108,14 @@ function setupListeners() {
   randomSeedBtn.addEventListener("click", () => {
     seedInput.value = Math.floor(Math.random() * 1e9).toString();
     startGame(seedInput.value);
+  });
+  setSeedBtn.addEventListener("click", () => {
+    let value = seedInput.value.trim();
+    if (!value) {
+      value = Math.floor(Math.random() * 1e9).toString();
+      seedInput.value = value;
+    }
+    startGame(value);
   });
   specialButton.addEventListener("click", () => {
     if (!state.building || state.playerSpecial.placed) return;
@@ -143,7 +150,6 @@ function startGame(seedText) {
   const safeSeed = seedText || Date.now().toString();
   state.seed = safeSeed;
   seedInput.value = safeSeed;
-  updateSeedInUrl(safeSeed);
   state.rng = mulberry32(hashSeed(safeSeed));
 
   state.baseGrid = generateBaseGrid(state.rng);
@@ -1019,16 +1025,6 @@ function getSpecialTypeName(type) {
   return "Vertical Strip";
 }
 
-function updateSeedInUrl(seed) {
-  if (typeof window === "undefined") return;
-  const url = new URL(window.location.href);
-  if (seed) {
-    url.searchParams.set("seed", seed);
-  } else {
-    url.searchParams.delete("seed");
-  }
-  window.history.replaceState({}, "", url);
-}
 
 function updateSpecialInfo() {
   const status = state.playerSpecial.placed ? "placed" : "ready";
