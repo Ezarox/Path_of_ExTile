@@ -96,7 +96,9 @@ const state = {
 };
 let padPulseTimer = 0;
 
-seedInput.value = Math.floor(Math.random() * 1e9).toString();
+const initialSeedParam = new URLSearchParams(window.location.search).get("seed");
+const initialSeed = initialSeedParam || Math.floor(Math.random() * 1e9).toString();
+seedInput.value = initialSeed;
 setupListeners();
 showMainMenu();
 let lastFrame = performance.now();
@@ -141,6 +143,7 @@ function startGame(seedText) {
   const safeSeed = seedText || Date.now().toString();
   state.seed = safeSeed;
   seedInput.value = safeSeed;
+  updateSeedInUrl(safeSeed);
   state.rng = mulberry32(hashSeed(safeSeed));
 
   state.baseGrid = generateBaseGrid(state.rng);
@@ -1014,6 +1017,17 @@ function getSpecialTypeName(type) {
   if (type === "radius") return "Slow Aura";
   if (type === "row") return "Horizontal Strip";
   return "Vertical Strip";
+}
+
+function updateSeedInUrl(seed) {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (seed) {
+    url.searchParams.set("seed", seed);
+  } else {
+    url.searchParams.delete("seed");
+  }
+  window.history.replaceState({}, "", url);
 }
 
 function updateSpecialInfo() {
