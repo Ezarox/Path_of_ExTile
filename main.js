@@ -16,6 +16,8 @@ const NPC_SPEED = 2.5;
 const NPC_RADIUS = 0.35;
 const PAD_PULSE_PERIOD = 3.5;
 const ENTRANCE_X = Math.floor(GRID_SIZE / 2);
+const FIXED_TIMESTEP = 1 / 120;
+const MAX_FRAME_DELTA = 0.1;
 
 const CELL_EMPTY = 0;
 const CELL_STATIC = 1;
@@ -76,7 +78,7 @@ const state = {
   rng: mulberry32(1),
   seed: "",
   building: true,
-  buildEndsAt: 0,
+  buildTimeLeft: 0,
   coins: 0,
   coinBudget: 0,
   playerBlocks: [],
@@ -101,6 +103,7 @@ seedInput.value = Math.floor(Math.random() * 1e9).toString();
 setupListeners();
 showMainMenu();
 let lastFrame = performance.now();
+let accumulator = 0;
 requestAnimationFrame(loop);
 
 function setupListeners() {
@@ -164,7 +167,7 @@ function startGame(seedText) {
   state.aiSpecial = null;
   state.building = true;
   state.buildMode = "normal";
-  state.buildEndsAt = performance.now() + BUILD_DURATION;
+  state.buildTimeLeft = BUILD_DURATION / 1000;
   state.hoverCell = null;
   state.floatingTexts = [];
   state.race = null;
@@ -313,6 +316,7 @@ function startRace(forceStart = false) {
   }
   state.waitingForSpecial = false;
   state.building = false;
+  state.buildTimeLeft = 0;
   state.hoverCell = null;
   toggleBuildMode(false);
 
@@ -354,9 +358,9 @@ function startRace(forceStart = false) {
 
   state.race = {
     runners: [playerRunner, aiRunner],
-    startTime: performance.now(),
     finished: false,
-    elapsed: null
+    elapsed: null,
+    elapsedTime: 0
   };
   state.results = { player: null, ai: null, winner: null };
   updatePhaseLabel("Phase: Race");
@@ -442,17 +446,18 @@ function createRunner(label, grid, special) {
     segmentIndex: 0,
     segmentProgress: 0,
     segmentLengths: computeSegmentLengths(path),
-    startTimestamp: null,
     finished: !path.length,
     resultTime: null,
     worldPos: null,
+    elapsedTime: 0,
     effects: { slowTimer: 0, fastTimer: 0, areaTimer: 0, speedMultiplier: 1 }
   };
 }
 
-function updateRace(delta, timestamp) {
+function updateRace(delta) {
   if (!state.race) return;
   let allFinished = true;
+  state.race.elapsedTime += delta;
   state.race.runners.forEach((runner) => {
     if (runner.finished) return;
     allFinished = false;
@@ -461,10 +466,11 @@ function updateRace(delta, timestamp) {
       recordResult(runner, null);
       return;
     }
-    if (!runner.startTimestamp) runner.startTimestamp = timestamp;
     updateRunnerEffects(runner, delta);
-    let remaining = delta * NPC_SPEED * runner.effects.speedMultiplier;
-    while (remaining > 0 && runner.segmentIndex < runner.segmentLengths.length) {
+    const speed = NPC_SPEED * runner.effects.speedMultiplier;
+    let remainingDistance = speed * delta;
+    let timeConsumed = 0;
+    while (remainingDistance > 0 && runner.segmentIndex < runner.segmentLengths.length) {
       const segmentLength = runner.segmentLengths[runner.segmentIndex] || 0;
       if (segmentLength === 0) {
         runner.segmentIndex++;
@@ -472,11 +478,13 @@ function updateRace(delta, timestamp) {
         continue;
       }
       const segmentRemaining = segmentLength - runner.segmentProgress;
-      if (remaining < segmentRemaining) {
-        runner.segmentProgress += remaining;
-        remaining = 0;
+      if (remainingDistance < segmentRemaining) {
+        runner.segmentProgress += remainingDistance;
+        timeConsumed += remainingDistance / speed;
+        remainingDistance = 0;
       } else {
-        remaining -= segmentRemaining;
+        remainingDistance -= segmentRemaining;
+        timeConsumed += segmentRemaining / speed;
         runner.segmentIndex++;
         runner.segmentProgress = 0;
         triggerPanelForRunner(runner);
@@ -485,17 +493,20 @@ function updateRace(delta, timestamp) {
     runner.worldPos = runnerWorldPosition(runner);
     checkPanelUnderRunner(runner);
     updateSpecialArea(runner, delta);
+    runner.elapsedTime += timeConsumed;
     if (runner.segmentIndex >= runner.segmentLengths.length) {
       runner.finished = true;
-      const elapsed = (timestamp - runner.startTimestamp) / 1000;
-      runner.resultTime = elapsed;
-      recordResult(runner, elapsed);
+      runner.resultTime = runner.elapsedTime;
+      recordResult(runner, runner.resultTime);
     }
   });
   if (state.race.finished) return;
   if (allFinished) {
     state.race.finished = true;
-    state.race.elapsed = state.race.startTime ? (timestamp - state.race.startTime) / 1000 : null;
+    const playerTime = state.results.player ?? 0;
+    const aiTime = state.results.ai ?? 0;
+    state.race.elapsed = Math.max(playerTime, aiTime);
+    state.race.elapsedTime = state.race.elapsed;
     decideWinner();
     updatePhaseLabel("Phase: Complete");
   }
@@ -611,20 +622,22 @@ function runnerWorldPosition(runner) {
   };
 }
 
-function updateState(delta, timestamp) {
+function updateState(delta) {
   padPulseTimer = (padPulseTimer + delta) % PAD_PULSE_PERIOD;
   if (state.building) {
-    const remaining = Math.max(0, state.buildEndsAt - timestamp);
-    if (remaining <= 0) {
-      startRace(true);
+    if (!state.paused) {
+      state.buildTimeLeft = Math.max(0, state.buildTimeLeft - delta);
+      if (state.buildTimeLeft <= 0) {
+        startRace(true);
+      }
     }
-  } else if (state.race && !state.paused) {
-    updateRace(delta, timestamp);
+  } else if (state.race && !state.paused && !state.race.finished) {
+    updateRace(delta);
   }
   updateFloatingTexts(delta);
-  updateHud(timestamp);
+  updateHud();
 }
-function updateHud(timestamp) {
+function updateHud() {
   if (state.mode === "menu") {
     timerEl.textContent = "Build Time: --";
     coinsEl.textContent = "Coins: --";
@@ -634,11 +647,10 @@ function updateHud(timestamp) {
     timerEl.textContent = "Paused";
     coinsEl.textContent = "Coins: --";
   } else if (state.building) {
-    const remaining = Math.max(0, state.buildEndsAt - timestamp);
-    timerEl.textContent = `Build Time: ${(remaining / 1000).toFixed(1)}s`;
+    timerEl.textContent = `Build Time: ${Math.max(0, state.buildTimeLeft).toFixed(1)}s`;
     coinsEl.textContent = `Coins: ${state.coins}`;
   } else if (state.race && !state.race.finished) {
-    const elapsed = ((timestamp - state.race.startTime) / 1000) || 0;
+    const elapsed = state.race.elapsedTime || 0;
     timerEl.textContent = `Race Time: ${elapsed.toFixed(1)}s`;
     coinsEl.textContent = "Coins: --";
   } else if (state.race && state.race.finished && state.race.elapsed !== null) {
@@ -1100,11 +1112,13 @@ function hideLoadingOverlay() {
 function showPause() {
   state.paused = true;
   pauseOverlay.classList.remove("hidden");
+  updateHud();
 }
 
 function hidePause() {
   state.paused = false;
   pauseOverlay.classList.add("hidden");
+  updateHud();
 }
 
 function resumeGame() {
@@ -1113,12 +1127,22 @@ function resumeGame() {
 }
 
 function loop(timestamp) {
-  const delta = (timestamp - lastFrame) / 1000;
+  let delta = (timestamp - lastFrame) / 1000;
   lastFrame = timestamp;
-  if (!state.paused && state.mode !== "menu") {
-    updateState(delta, timestamp);
-    draw();
+  if (delta > MAX_FRAME_DELTA) delta = MAX_FRAME_DELTA;
+
+  if (state.mode === "menu" || state.paused) {
+    accumulator = 0;
+    requestAnimationFrame(loop);
+    return;
   }
+
+  accumulator += delta;
+  while (accumulator >= FIXED_TIMESTEP) {
+    updateState(FIXED_TIMESTEP);
+    accumulator -= FIXED_TIMESTEP;
+  }
+  draw();
   requestAnimationFrame(loop);
 }
 // GRID HELPERS ------------------------------------------------------------
