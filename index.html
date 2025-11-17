@@ -29,6 +29,34 @@
   </div>
 
   <main class="layout">
+    <div id="statusBoard" class="status-board hidden">
+      <div class="timer-panel">
+        <div class="panel-header">
+          <div class="panel-title" id="timerStatus">--</div>
+          <span class="panel-line"></span>
+        </div>
+        <div class="timer-value" id="timer">--</div>
+      </div>
+      <div class="mini-currency">
+        <button id="wallsCard" class="mini-card walls" type="button">
+          <div class="panel-header">
+            <div class="panel-title">WALLS</div>
+            <span class="panel-line"></span>
+          </div>
+          <div class="mini-value" id="wallsValue">--</div>
+        </button>
+        <button id="specialCard" class="mini-card special" type="button">
+          <div class="panel-header">
+            <div class="panel-title">SPECIAL</div>
+            <span class="panel-line"></span>
+          </div>
+          <div class="mini-value" id="specialValue">--</div>
+        </button>
+      </div>
+    </div>
+    <div class="canvas-wrapper">
+      <canvas id="game"></canvas>
+    </div>
     <section class="hud hidden" id="gameHud">
       <div class="controls">
         <label class="seed-field">
@@ -38,21 +66,19 @@
         <button id="setSeed" type="button">Set Seed</button>
         <button id="randomSeed" type="button">New Seed</button>
         <button id="newGame" type="button">Restart</button>
-        <button id="specialButton" type="button">Place Special</button>
         <button id="menuButton" type="button">Main Menu</button>
       </div>
       <div class="stats">
         <span id="phase">Phase: --</span>
-        <span id="timer">Build Time: --</span>
-        <span id="coins">Coins: --</span>
         <span id="score">Score: --</span>
         <span id="specialInfo">Special: --</span>
       </div>
-      <p class="hint">
-        Place 2x2 blocks during the build phase (right-click player blocks to refund). Toggle the special button to place your single special structure, and right-click it to refund.
-      </p>
+      <div class="hud-notes">
+        <p>
+          Place 2x2 walls during the build phase (your pool changes every round). Right-click walls to refund them, or use the Special card to place your single unique structure.
+        </p>
+      </div>
     </section>
-    <canvas id="game"></canvas>
   </main>
   <div id="resultPopup" class="result-popup hidden">
     <div class="result-card">

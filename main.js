@@ -53,9 +53,13 @@ const seedInput = document.getElementById("seedInput");
 const newGameBtn = document.getElementById("newGame");
 const randomSeedBtn = document.getElementById("randomSeed");
 const setSeedBtn = document.getElementById("setSeed");
-const specialButton = document.getElementById("specialButton");
 const timerEl = document.getElementById("timer");
-const coinsEl = document.getElementById("coins");
+const timerStatusEl = document.getElementById("timerStatus");
+const statusBoard = document.getElementById("statusBoard");
+const wallsCard = document.getElementById("wallsCard");
+const specialCard = document.getElementById("specialCard");
+const wallsValueEl = document.getElementById("wallsValue");
+const specialValueEl = document.getElementById("specialValue");
 const scoreEl = document.getElementById("score");
 const phaseEl = document.getElementById("phase");
 const specialInfoEl = document.getElementById("specialInfo");
@@ -70,6 +74,7 @@ const resumeBtn = document.getElementById("resumeBtn");
 const pauseMenuBtn = document.getElementById("pauseMenuBtn");
 const menuButton = document.getElementById("menuButton");
 const resultPopup = document.getElementById("resultPopup");
+const resultCard = resultPopup?.querySelector(".result-card");
 const popupMessageEl = document.getElementById("popupMessage");
 const popupEmojiEl = document.getElementById("popupEmoji");
 const popupCloseBtn = document.getElementById("closePopup");
@@ -120,9 +125,13 @@ function setupListeners() {
     }
     startGame(value);
   });
-  specialButton.addEventListener("click", () => {
+  wallsCard?.addEventListener("click", () => {
+    if (!state.building || state.coins <= 0) return;
+    setBuildMode("normal");
+  });
+  specialCard?.addEventListener("click", () => {
     if (!state.building || state.playerSpecial.placed) return;
-    toggleBuildMode();
+    setBuildMode("special");
   });
   canvas.addEventListener("click", handleCanvasClick);
   canvas.addEventListener("contextmenu", handleRightClick);
@@ -173,6 +182,7 @@ function startGame(seedText) {
   state.race = null;
   state.results = { player: null, ai: null, winner: null };
   state.waitingForSpecial = false;
+  setBuildMode("normal");
   updateSpecialInfo();
   updatePhaseLabel("Phase: Build");
   hideResultPopup();
@@ -201,8 +211,8 @@ function handleCanvasClick(evt) {
       addFloatingText("Special already placed", evt);
       return;
     }
-    if (tryPlaceSpecial(state.playerGrid, cell.x, cell.y, state.playerSpecial)) {
-      toggleBuildMode(false);
+  if (tryPlaceSpecial(state.playerGrid, cell.x, cell.y, state.playerSpecial)) {
+      setBuildMode("normal");
       updateSpecialInfo();
       if (state.coins <= 0) {
         startRace();
@@ -214,7 +224,9 @@ function handleCanvasClick(evt) {
   }
 
   if (state.coins <= 0) {
-    addFloatingText("Out of coins! Place your special to begin.", evt, "#ff6b6b");
+    if (!state.playerSpecial.placed) {
+      addFloatingText("Out of walls! Place your special to begin.", evt, "#ff6b6b");
+    }
     return;
   }
 
@@ -225,7 +237,10 @@ function handleCanvasClick(evt) {
   state.playerBlocks.push({ x: cell.x, y: cell.y });
   state.coins -= 1;
   if (state.coins <= 0) {
-    addFloatingText("Coins spent! Place your special to begin.", evt, "#99ff99");
+    if (!state.playerSpecial.placed) {
+      addFloatingText("Walls placed! Add your special to begin.", evt, "#99ff99");
+      setBuildMode("special");
+    }
     startRace();
   }
 }
@@ -239,7 +254,7 @@ function handleRightClick(evt) {
   if (state.playerSpecial.placed && cell.x === state.playerSpecial.cell.x && cell.y === state.playerSpecial.cell.y) {
     state.playerGrid[cell.y][cell.x] = CELL_EMPTY;
     state.playerSpecial = createSpecialTemplate(state.specialTemplate.type);
-    toggleBuildMode(false);
+    setBuildMode("normal");
     updateSpecialInfo();
     return;
   }
@@ -250,7 +265,12 @@ function handleRightClick(evt) {
   if (idx === -1) return;
   clearBlock(state.playerGrid, state.playerBlocks[idx].x, state.playerBlocks[idx].y);
   state.playerBlocks.splice(idx, 1);
+  const prevCoins = state.coins;
   state.coins = Math.min(state.coins + 1, state.coinBudget);
+  if (prevCoins === 0 && state.coins > 0 && state.waitingForSpecial) {
+    state.waitingForSpecial = false;
+  }
+  updateResourceCards();
 }
 
 function handleMouseMove(evt) {
@@ -262,14 +282,16 @@ function handleMouseMove(evt) {
   state.hoverCell = cell;
 }
 
-function toggleBuildMode(forceNormal = false) {
-  state.buildMode = forceNormal ? "normal" : state.buildMode === "normal" ? "special" : "normal";
-  if (state.buildMode === "special") {
-    specialButton.classList.add("active");
-  } else {
-    specialButton.classList.remove("active");
+function setBuildMode(mode = "normal") {
+  if (!state.building) {
+    mode = "normal";
+  } else if (mode === "special" && state.playerSpecial?.placed) {
+    mode = "normal";
   }
+  state.buildMode = mode;
+  updateCurrencySelection();
 }
+
 
 function tryPlaceBlock(grid, gx, gy) {
   if (!canPlaceBlock(grid, gx, gy)) return false;
@@ -309,7 +331,9 @@ function startRace(forceStart = false) {
   if (!state.building) return;
   if (!state.playerSpecial.placed && !forceStart) {
     if (!state.waitingForSpecial) {
-      notifySpecialNeeded();
+      if (state.coins > 0) {
+        notifySpecialNeeded();
+      }
       state.waitingForSpecial = true;
     }
     return;
@@ -318,7 +342,7 @@ function startRace(forceStart = false) {
   state.building = false;
   state.buildTimeLeft = 0;
   state.hoverCell = null;
-  toggleBuildMode(false);
+  setBuildMode("normal");
 
   const playerGrid = cloneGrid(state.playerGrid);
   const playerSpecial = cloneSpecial(state.playerSpecial);
@@ -639,28 +663,60 @@ function updateState(delta) {
 }
 function updateHud() {
   if (state.mode === "menu") {
-    timerEl.textContent = "Build Time: --";
-    coinsEl.textContent = "Coins: --";
+    timerEl.textContent = "--";
+    timerStatusEl.textContent = "Awaiting run";
     scoreEl.textContent = "Score: --";
+    updateResourceCards();
     return;
-  } else if (state.paused) {
-    timerEl.textContent = "Paused";
-    coinsEl.textContent = "Coins: --";
+  }
+
+  if (state.paused) {
+    timerEl.textContent = "--";
+    timerStatusEl.textContent = "Paused";
   } else if (state.building) {
-    timerEl.textContent = `Build Time: ${Math.max(0, state.buildTimeLeft).toFixed(1)}s`;
-    coinsEl.textContent = `Coins: ${state.coins}`;
+    timerEl.textContent = `${Math.max(0, state.buildTimeLeft).toFixed(1)}s`;
+    timerStatusEl.textContent = "Build phase";
   } else if (state.race && !state.race.finished) {
     const elapsed = state.race.elapsedTime || 0;
-    timerEl.textContent = `Race Time: ${elapsed.toFixed(1)}s`;
-    coinsEl.textContent = "Coins: --";
+    timerEl.textContent = `${elapsed.toFixed(1)}s`;
+    timerStatusEl.textContent = "Race in progress";
   } else if (state.race && state.race.finished && state.race.elapsed !== null) {
-    timerEl.textContent = `Race Time: ${state.race.elapsed.toFixed(1)}s`;
-    coinsEl.textContent = "Coins: --";
+    timerEl.textContent = `${state.race.elapsed.toFixed(1)}s`;
+    timerStatusEl.textContent = "Race complete";
   } else {
-    timerEl.textContent = "Race Time: --";
-    coinsEl.textContent = "Coins: --";
+    timerEl.textContent = "--";
+    timerStatusEl.textContent = "Ready";
   }
   scoreEl.textContent = formatScoreText();
+  updateResourceCards();
+}
+
+function updateResourceCards() {
+  if (!wallsValueEl || !specialValueEl) return;
+  if (state.mode === "menu") {
+    wallsValueEl.textContent = "--";
+    specialValueEl.textContent = "--";
+    updateCurrencySelection(true);
+    return;
+  }
+  wallsValueEl.textContent = state.coins != null ? state.coins : "--";
+  const specialsRemaining = state.playerSpecial?.placed ? 0 : 1;
+  specialValueEl.textContent = specialsRemaining.toString();
+  updateCurrencySelection();
+}
+
+function updateCurrencySelection(forceDisabled = false) {
+  if (wallsCard) {
+    const canUseWalls = !forceDisabled && state.building && state.coins > 0;
+    wallsCard.classList.toggle("disabled", !canUseWalls);
+    wallsCard.classList.toggle("active", state.building && state.buildMode === "normal" && canUseWalls);
+  }
+  if (specialCard) {
+    const canUseSpecial = !forceDisabled && state.building && !state.playerSpecial?.placed;
+    const isActive = state.building && state.buildMode === "special" && canUseSpecial;
+    specialCard.classList.toggle("disabled", !canUseSpecial);
+    specialCard.classList.toggle("active", isActive);
+  }
 }
 
 function formatScoreText() {
@@ -673,6 +729,22 @@ function formatScoreText() {
   const aiText = formatVal(state.results.ai);
   return `Score: You ${playerText} | AI ${aiText}`;
 }
+
+function formatLabelScore(label) {
+  const finished = !!(state.race && state.race.finished);
+  const valFor = (val) => {
+    if (val == null) return finished ? " (DNF)" : " (--)";
+    return ` (${val.toFixed(2)}s)`;
+  };
+  if (label.startsWith("You")) {
+    return valFor(state.results.player);
+  }
+  if (label.startsWith("AI")) {
+    return valFor(state.results.ai);
+  }
+  return "";
+}
+
 
 function draw() {
   ctx.fillStyle = "#050505";
@@ -765,7 +837,7 @@ function drawView(view, offsetX) {
   ctx.fillStyle = "#ffffff";
   ctx.font = "16px system-ui";
   ctx.textBaseline = "top";
-  ctx.fillText(view.label, VIEW_BORDER + 10, 8);
+  ctx.fillText(`${view.label}${formatLabelScore(view.label)}`, VIEW_BORDER + 10, 8);
 
   ctx.restore();
 }
@@ -773,6 +845,10 @@ function drawView(view, offsetX) {
 function drawSpecialOverlay(special) {
   ctx.save();
   if (special.type === "radius") {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, GRID_OFFSET_Y, VIEW_WIDTH, GRID_SIZE * CELL_SIZE);
+    ctx.clip();
     const centerX = (special.cell.x + 0.5) * CELL_SIZE;
     const centerY = GRID_OFFSET_Y + (special.cell.y + 0.5) * CELL_SIZE;
     const radius = SPECIAL_RADIUS * CELL_SIZE;
@@ -790,6 +866,7 @@ function drawSpecialOverlay(special) {
     ctx.beginPath();
     ctx.arc(centerX, centerY, innerRadius, 0, Math.PI * 2);
     ctx.fill();
+    ctx.restore();
   } else if (special.type === "row") {
     const y = GRID_OFFSET_Y + special.cell.y * CELL_SIZE;
     const innerY = y + CELL_SIZE * 0.25;
@@ -859,7 +936,8 @@ function specialPaletteForCell(special, x, y) {
       outer: "#4e2a74",
       inner: "#b98cff",
       border: "#110517",
-      highlight: "rgba(255,255,255,0.2)"
+      highlight: "rgba(255,255,255,0.2)",
+      arrow: special.type === "row" ? "horizontal" : "vertical"
     };
   }
   return null;
@@ -983,8 +1061,8 @@ function drawHoverPreview() {
       ctx.restore();
       return;
     }
-    const outOfCoins = state.coins <= 0;
-    ctx.fillStyle = outOfCoins ? "rgba(255, 80, 80, 0.4)" : "rgba(255,255,255,0.15)";
+    const outOfWalls = state.coins <= 0;
+    ctx.fillStyle = outOfWalls ? "rgba(255, 80, 80, 0.4)" : "rgba(255,255,255,0.15)";
     ctx.fillRect(x * CELL_SIZE, GRID_OFFSET_Y + y * CELL_SIZE, CELL_SIZE * 2, CELL_SIZE * 2);
   }
   ctx.restore();
@@ -1041,9 +1119,7 @@ function getSpecialTypeName(type) {
 function updateSpecialInfo() {
   const status = state.playerSpecial.placed ? "placed" : "ready";
   specialInfoEl.textContent = `Special: ${getSpecialTypeName(state.playerSpecial.type)} (${status})`;
-  if (state.playerSpecial.placed) {
-    specialButton.classList.remove("active");
-  }
+  updateResourceCards();
 }
 
 function updatePhaseLabel(text) {
@@ -1068,10 +1144,19 @@ function showResultPopup() {
     2
   )}s &nbsp;|&nbsp; AI: ${ai == null ? "DNF" : ai.toFixed(2)}s</span>`;
   resultPopup.classList.remove("hidden");
+  document.addEventListener("mousedown", handlePopupBackdrop, true);
 }
 
 function hideResultPopup() {
   resultPopup.classList.add("hidden");
+  document.removeEventListener("mousedown", handlePopupBackdrop, true);
+}
+
+function handlePopupBackdrop(evt) {
+  if (!resultCard) return;
+  if (!resultCard.contains(evt.target)) {
+    hideResultPopup();
+  }
 }
 
 function notifySpecialNeeded() {
@@ -1090,14 +1175,18 @@ function showMainMenu() {
   state.mode = "menu";
   state.paused = true;
   hud.classList.add("hidden");
+  statusBoard?.classList.add("hidden");
   menuOverlay.classList.remove("hidden");
   pauseOverlay.classList.add("hidden");
+  updateHud();
 }
 
 function hideMainMenu() {
   state.mode = "game";
   hud.classList.remove("hidden");
+  statusBoard?.classList.remove("hidden");
   menuOverlay.classList.add("hidden");
+  updateHud();
 }
 
 function showLoadingOverlay(message = "Preparing...") {
@@ -1440,17 +1529,34 @@ function drawPlayerBlockSprite(gridX, gridY) {
 function drawSpecialBlockSprite(gridX, gridY, paletteOverride) {
   const baseX = gridX * CELL_SIZE;
   const baseY = GRID_OFFSET_Y + gridY * CELL_SIZE;
-  ctx.save();
-  drawBeveledTile(
-    baseX,
-    baseY,
+  const palette =
     paletteOverride || {
       outer: "#f3cf63",
       inner: "#ffeaa2",
       border: "#3b2f10",
       highlight: "rgba(255,255,255,0.2)"
-    }
-  );
+    };
+  const { arrow, ...tilePalette } = palette;
+  ctx.save();
+  drawBeveledTile(baseX, baseY, tilePalette);
+  if (arrow) {
+    drawBlockLine(baseX, baseY, arrow);
+  }
+  ctx.restore();
+}
+
+function drawBlockLine(baseX, baseY, direction) {
+  ctx.save();
+  ctx.fillStyle = "rgba(70, 30, 110, 0.85)";
+  const inset = 8;
+  const thickness = 4;
+  if (direction === "horizontal") {
+    const midY = baseY + CELL_SIZE / 2 - thickness / 2;
+    ctx.fillRect(baseX + inset, midY, CELL_SIZE - inset * 2, thickness);
+  } else {
+    const midX = baseX + CELL_SIZE / 2 - thickness / 2;
+    ctx.fillRect(midX, baseY + inset, thickness, CELL_SIZE - inset * 2);
+  }
   ctx.restore();
 }
 
@@ -1515,7 +1621,10 @@ function cloneSpecial(special) {
 }
 
 function pickSpecialType(rng) {
-  return SPECIAL_TYPES[randomInt(rng, 0, SPECIAL_TYPES.length - 1)];
+  const roll = rng();
+  if (roll < 0.5) return "radius";
+  if (roll < 0.75) return "row";
+  return "column";
 }
 
 function isPointInsideSpecial(pos, special) {
@@ -1586,3 +1695,19 @@ function hexToRgb(hex) {
   };
 }
 
+  if (!ctx.roundRect) {
+    ctx.beginPath();
+    ctx.moveTo(6 + 8, 6);
+    ctx.lineTo(6 + size - 8, 6);
+    ctx.quadraticCurveTo(6 + size, 6, 6 + size, 6 + 8);
+    ctx.lineTo(6 + size, 6 + size - 8);
+    ctx.quadraticCurveTo(6 + size, 6 + size, 6 + size - 8, 6 + size);
+    ctx.lineTo(6 + 8, 6 + size);
+    ctx.quadraticCurveTo(6, 6 + size, 6, 6 + size - 8);
+    ctx.lineTo(6, 6 + 8);
+    ctx.quadraticCurveTo(6, 6, 6 + 8, 6);
+    ctx.closePath();
+  } else {
+    ctx.beginPath();
+    ctx.roundRect(6, 6, size, size, 8);
+  }
