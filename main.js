@@ -28,10 +28,13 @@ const CELL_SPEED_USED = 5;
 const CELL_SLOW_USED = 6;
 const CELL_SPECIAL = 7;
 
-const SPECIAL_TYPES = ["radius", "row", "column"];
-const SPECIAL_RADIUS = 2.6;
+const SPECIAL_TYPES = ["radius", "row", "column", "gravity", "lightning"];
+const SPECIAL_RADIUS = 4;
 const SPECIAL_LINGER = 3;
+const FREEZING_BUILDUP = 10;
 const SPECIAL_SLOW_MULT = 0.7;
+const LIGHTNING_STUN = 1;
+const LIGHTNING_COOLDOWN = 4;
 const PANEL_SLOW_MULT = 0.55;
 const PANEL_FAST_MULT = 1.5;
 
@@ -504,7 +507,16 @@ function createRunner(label, grid, special) {
     resultTime: null,
     worldPos: null,
     elapsedTime: 0,
-    effects: { slowTimer: 0, fastTimer: 0, areaTimer: 0, speedMultiplier: 1 }
+    effects: {
+      slowTimer: 0,
+      fastTimer: 0,
+      areaTimer: 0,
+      speedMultiplier: 1,
+      gravityActive: false,
+      gravityPull: null,
+      gravityOffset: null,
+      stunTimer: 0
+    }
   };
 }
 
@@ -596,12 +608,33 @@ function decideWinner() {
 function updateRunnerEffects(runner, delta) {
   const effects = runner.effects;
   if (effects.slowTimer > 0) effects.slowTimer = Math.max(0, effects.slowTimer - delta);
+  if (effects.stunTimer > 0) effects.stunTimer = Math.max(0, effects.stunTimer - delta);
+  if (effects.stunTimer > 0) {
+    runner.effects.speedMultiplier = 0;
+    return;
+  }
   if (effects.fastTimer > 0) effects.fastTimer = Math.max(0, effects.fastTimer - delta);
-  if (effects.areaTimer > 0) effects.areaTimer = Math.max(0, effects.areaTimer - delta);
+  const specialType = runner.special?.type;
+  if (effects.areaTimer > 0 && specialType !== "radius") {
+    effects.areaTimer = Math.max(0, effects.areaTimer - delta);
+  }
   let mult = 1;
   if (effects.slowTimer > 0) mult *= PANEL_SLOW_MULT;
-  if (effects.areaTimer > 0) mult *= SPECIAL_SLOW_MULT;
+  if (specialType === "radius") {
+    if (effects.areaTimer > 0) {
+      const ratio = Math.min(1, effects.areaTimer / FREEZING_BUILDUP);
+      const auraMult = SPECIAL_SLOW_MULT - (SPECIAL_SLOW_MULT - 0.1) * ratio;
+      mult *= auraMult;
+    }
+  } else if (effects.areaTimer > 0) {
+    mult *= SPECIAL_SLOW_MULT;
+  }
   if (effects.fastTimer > 0) mult *= PANEL_FAST_MULT;
+  if (effects.gravityActive && effects.gravityPull) {
+    const ratio = Math.max(0, Math.min(1, effects.gravityPull.distance / SPECIAL_RADIUS));
+    const target = 0.4 + (0.7 - 0.4) * ratio;
+    mult *= target;
+  }
   runner.effects.speedMultiplier = mult;
 }
 
@@ -646,9 +679,57 @@ function updateSpecialArea(runner, delta) {
   const special = runner.special;
   if (!special?.placed || !special.cell) {
     runner.effects.areaTimer = 0;
+    runner.effects.gravityActive = false;
+    runner.effects.gravityPull = null;
+    runner.effects.gravityOffset = decayGravityOffset(runner.effects.gravityOffset, delta);
     return;
   }
   const pos = runner.worldPos || runnerWorldPosition(runner);
+  if (special.type === "gravity") {
+    const centerX = special.cell.x + 0.5;
+    const centerY = special.cell.y + 0.5;
+    const dx = centerX - pos.x;
+    const dy = centerY - pos.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist <= SPECIAL_RADIUS) {
+      runner.effects.gravityActive = true;
+      const norm = dist === 0 ? 0 : 1 / dist;
+      runner.effects.gravityPull = { x: dx * norm, y: dy * norm, distance: dist };
+      runner.effects.gravityOffset = { x: dx * norm * 0.15, y: dy * norm * 0.15 };
+    } else {
+      runner.effects.gravityActive = false;
+      runner.effects.gravityPull = null;
+      runner.effects.gravityOffset = decayGravityOffset(runner.effects.gravityOffset, delta);
+    }
+    runner.effects.areaTimer = 0;
+    return;
+  }
+  runner.effects.gravityActive = false;
+  runner.effects.gravityPull = null;
+  runner.effects.gravityOffset = decayGravityOffset(runner.effects.gravityOffset, delta);
+  if (special.type === "radius") {
+    if (isPointInsideSpecial(pos, special)) {
+      runner.effects.areaTimer = Math.min(FREEZING_BUILDUP, runner.effects.areaTimer + delta);
+    } else {
+      const decayRate = FREEZING_BUILDUP / SPECIAL_LINGER;
+      runner.effects.areaTimer = Math.max(0, runner.effects.areaTimer - decayRate * delta);
+    }
+    return;
+  }
+  if (special.type === "lightning") {
+    special.cooldown = Math.max(0, (special.cooldown || 0) - delta);
+    special.flashTimer = Math.max(0, (special.flashTimer || 0) - delta);
+    const centerX = special.cell.x + 0.5;
+    const centerY = special.cell.y + 0.5;
+    const dist = Math.hypot(centerX - pos.x, centerY - pos.y);
+    if (dist <= SPECIAL_RADIUS && special.cooldown <= 0 && runner.effects.stunTimer <= 0) {
+      runner.effects.stunTimer = LIGHTNING_STUN;
+      special.cooldown = LIGHTNING_COOLDOWN;
+      special.flashTimer = 0.3;
+    }
+    runner.effects.areaTimer = 0;
+    return;
+  }
   if (isPointInsideSpecial(pos, special)) {
     special.effectTimer = SPECIAL_LINGER;
   } else if (special.effectTimer > 0) {
@@ -670,10 +751,15 @@ function runnerWorldPosition(runner) {
   const endCenter = centerOf(end);
   const segmentLength = runner.segmentLengths[runner.segmentIndex] || 1;
   const t = Math.min(1, runner.segmentProgress / segmentLength);
-  return {
+  const pos = {
     x: startCenter.x + (endCenter.x - startCenter.x) * t,
     y: startCenter.y + (endCenter.y - startCenter.y) * t
   };
+  if (runner.effects.gravityOffset) {
+    pos.x += runner.effects.gravityOffset.x;
+    pos.y += runner.effects.gravityOffset.y;
+  }
+  return pos;
 }
 
 function updateState(delta) {
@@ -892,10 +978,87 @@ function drawSpecialOverlay(special) {
     ctx.arc(centerX, centerY, innerRadius, 0, Math.PI * 2, true);
     ctx.fill();
 
-    ctx.fillStyle = "rgba(90, 160, 255, 0.08)";
+    ctx.fillStyle = "rgba(180, 220, 255, 0.12)";
     ctx.beginPath();
-    ctx.arc(centerX, centerY, innerRadius, 0, Math.PI * 2);
+    ctx.arc(centerX, centerY, innerRadius * 0.9, 0, Math.PI * 2);
     ctx.fill();
+    drawSnowflake(centerX, centerY, innerRadius * 0.8);
+    drawIcyArrows(centerX, centerY, innerRadius);
+    ctx.restore();
+  } else if (special.type === "gravity") {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, GRID_OFFSET_Y, VIEW_WIDTH, GRID_SIZE * CELL_SIZE);
+    ctx.clip();
+    const centerX = (special.cell.x + 0.5) * CELL_SIZE;
+    const centerY = GRID_OFFSET_Y + (special.cell.y + 0.5) * CELL_SIZE;
+    const radius = SPECIAL_RADIUS * CELL_SIZE;
+    const grad = ctx.createRadialGradient(centerX, centerY, radius * 0.2, centerX, centerY, radius);
+    grad.addColorStop(0, "rgba(150, 90, 220, 0.35)");
+    grad.addColorStop(1, "rgba(60, 20, 80, 0)");
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.15)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  } else if (special.type === "lightning") {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, GRID_OFFSET_Y, VIEW_WIDTH, GRID_SIZE * CELL_SIZE);
+    ctx.clip();
+    const centerX = (special.cell.x + 0.5) * CELL_SIZE;
+    const centerY = GRID_OFFSET_Y + (special.cell.y + 0.5) * CELL_SIZE;
+    const ratio = 1 - Math.min(1, (special.cooldown || 0) / LIGHTNING_COOLDOWN);
+    const radius = SPECIAL_RADIUS * CELL_SIZE;
+    const ready = (special.cooldown || 0) <= 0;
+    const colorReady = "rgba(255,215,130,0.28)";
+    const colorInactive = "rgba(140,140,160,0.08)";
+    ctx.shadowColor = ready ? "rgba(255,230,150,0.55)" : "rgba(200,210,250,0.25)";
+    ctx.shadowBlur = ready ? 24 : 12;
+    ctx.strokeStyle = ready ? colorReady : colorInactive;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    if (!ready) {
+      const spokes = 10;
+      for (let i = 0; i < spokes; i++) {
+        const angle = (Math.PI * 2 * i) / spokes;
+        const len = radius * ratio;
+        // grey guide
+        ctx.strokeStyle = "rgba(120,120,140,0.035)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(centerX, centerY);
+        ctx.lineTo(centerX + Math.cos(angle) * radius, centerY + Math.sin(angle) * radius);
+        ctx.stroke();
+        if (len > 0) {
+          // gold fill growing outward from center
+          ctx.shadowColor = "rgba(255,230,160,0.5)";
+          ctx.shadowBlur = 22;
+          ctx.strokeStyle = "rgba(255,215,130,0.2)";
+          ctx.beginPath();
+          ctx.moveTo(centerX, centerY);
+          ctx.lineTo(centerX + Math.cos(angle) * len, centerY + Math.sin(angle) * len);
+          ctx.stroke();
+          ctx.shadowBlur = ready ? 24 : 12;
+          ctx.shadowColor = ready ? "rgba(255,230,150,0.55)" : "rgba(200,210,250,0.25)";
+        }
+      }
+    }
+    if (ready || (special.flashTimer || 0) > 0) {
+      drawLightningBolts(centerX, centerY, radius, ratio, (special.flashTimer || 0) > 0);
+      if ((special.flashTimer || 0) > 0) {
+        drawElectricStun(centerX, centerY, radius * 0.5, ratio);
+      }
+    }
     ctx.restore();
   } else if (special.type === "row") {
     const y = GRID_OFFSET_Y + special.cell.y * CELL_SIZE;
@@ -955,10 +1118,10 @@ function specialPaletteForCell(special, x, y) {
   if (special.cell.x !== x || special.cell.y !== y) return null;
   if (special.type === "radius") {
     return {
-      outer: "#1b3866",
-      inner: "#64b6ff",
-      border: "#07111f",
-      highlight: "rgba(255,255,255,0.18)"
+      outer: "#1c2f4f",
+      inner: "#8ad0ff",
+      border: "#0c1624",
+      highlight: "rgba(255,255,255,0.25)"
     };
   }
   if (special.type === "row" || special.type === "column") {
@@ -968,6 +1131,14 @@ function specialPaletteForCell(special, x, y) {
       border: "#110517",
       highlight: "rgba(255,255,255,0.2)",
       arrow: special.type === "row" ? "horizontal" : "vertical"
+    };
+  }
+  if (special.type === "gravity") {
+    return {
+      outer: "#2a0b3f",
+      inner: "#9059d6",
+      border: "#120620",
+      highlight: "rgba(255,255,255,0.15)"
     };
   }
   return null;
@@ -1140,9 +1311,12 @@ function addFloatingText(text, evt, color) {
 }
 
 function getSpecialTypeName(type) {
-  if (type === "radius") return "Slow Aura";
-  if (type === "row") return "Horizontal Strip";
-  return "Vertical Strip";
+  if (type === "radius") return "Freezing Field";
+  if (type === "row") return "Horizontal Slow Beam";
+  if (type === "column") return "Vertical Slow Beam";
+  if (type === "gravity") return "Gravity Well";
+  if (type === "lightning") return "Lightning Strike";
+  return "Unknown";
 }
 
 
@@ -1596,7 +1770,8 @@ function drawSpecialBlockSprite(gridX, gridY, paletteOverride) {
       outer: "#f3cf63",
       inner: "#ffeaa2",
       border: "#3b2f10",
-      highlight: "rgba(255,255,255,0.2)"
+      highlight: "rgba(255,255,255,0.2)",
+      arrow: null
     };
   const { arrow, ...tilePalette } = palette;
   ctx.save();
@@ -1618,6 +1793,114 @@ function drawBlockLine(baseX, baseY, direction) {
   } else {
     const midX = baseX + CELL_SIZE / 2 - thickness / 2;
     ctx.fillRect(midX, baseY + inset, thickness, CELL_SIZE - inset * 2);
+  }
+  ctx.restore();
+}
+
+function drawSnowflake(cx, cy, radius) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(170, 210, 255, 0.25)";
+  ctx.lineWidth = 2;
+  const arms = 6;
+  for (let i = 0; i < arms; i++) {
+    const angle = (Math.PI * 2 * i) / arms;
+    const x = cx + Math.cos(angle) * radius;
+    const y = cy + Math.sin(angle) * radius;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    const branchAngle1 = angle + Math.PI / 6;
+    const branchAngle2 = angle - Math.PI / 6;
+    const branchLen = radius * 0.35;
+    const bx1 = x - Math.cos(angle) * branchLen + Math.cos(branchAngle1) * branchLen;
+    const by1 = y - Math.sin(angle) * branchLen + Math.sin(branchAngle1) * branchLen;
+    const bx2 = x - Math.cos(angle) * branchLen + Math.cos(branchAngle2) * branchLen;
+    const by2 = y - Math.sin(angle) * branchLen + Math.sin(branchAngle2) * branchLen;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(bx1, by1);
+    ctx.moveTo(x, y);
+    ctx.lineTo(bx2, by2);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawIcyArrows(cx, cy, radius) {
+  const color = "rgba(80, 140, 255, 0.25)";
+  drawRadialArrows(cx, cy, radius * 0.95, radius * 0.35, 6, 0, color);
+  drawRadialArrows(cx, cy, radius * 0.65, radius * 0.25, 6, Math.PI / 6, color);
+}
+
+function drawRadialArrows(cx, cy, outerLen, innerLen, count, offset, color) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 2;
+  for (let i = 0; i < count; i++) {
+    const angle = offset + (Math.PI * 2 * i) / count;
+    const innerX = cx + Math.cos(angle) * innerLen;
+    const innerY = cy + Math.sin(angle) * innerLen;
+    const outerX = cx + Math.cos(angle) * outerLen;
+    const outerY = cy + Math.sin(angle) * outerLen;
+    ctx.beginPath();
+    ctx.moveTo(innerX, innerY);
+    ctx.lineTo(outerX, outerY);
+    ctx.stroke();
+    const headAngle1 = angle + Math.PI / 6;
+    const headAngle2 = angle - Math.PI / 6;
+    const headSize = 6;
+    ctx.beginPath();
+    ctx.moveTo(outerX, outerY);
+    ctx.lineTo(outerX - Math.cos(headAngle1) * headSize, outerY - Math.sin(headAngle1) * headSize);
+    ctx.lineTo(outerX - Math.cos(headAngle2) * headSize, outerY - Math.sin(headAngle2) * headSize);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawLightningBolts(cx, cy, radius, ratio, flashing) {
+  const bolts = 6;
+  ctx.save();
+  for (let i = 0; i < bolts; i++) {
+    const angle = (Math.PI * 2 * i) / bolts + (ratio * Math.PI) / 3;
+    const length = radius * (0.6 + 0.2 * Math.random());
+    const points = [];
+    const segments = 4;
+    for (let s = 0; s <= segments; s++) {
+      const t = s / segments;
+      const r = length * t;
+      const wobble = (Math.random() - 0.5) * radius * 0.15 * (1 - t);
+      const px = cx + Math.cos(angle) * r + Math.cos(angle + Math.PI / 2) * wobble;
+      const py = cy + Math.sin(angle) * r + Math.sin(angle + Math.PI / 2) * wobble;
+      points.push({ x: px, y: py });
+    }
+    ctx.strokeStyle = flashing ? "rgba(255,255,255,0.85)" : "rgba(255,215,130,0.9)";
+    ctx.lineWidth = flashing ? 3 : 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    points.forEach((p) => ctx.lineTo(p.x, p.y));
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawElectricStun(cx, cy, radius, intensity) {
+  ctx.save();
+  const sparks = 12;
+  for (let i = 0; i < sparks; i++) {
+    const angle = (Math.PI * 2 * i) / sparks;
+    const len = radius * (0.6 + 0.3 * Math.random());
+    const wobble = (Math.random() - 0.5) * radius * 0.2;
+    const color = `rgba(255, 255, 255, ${0.5 + 0.3 * intensity})`;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.cos(angle) * len + Math.cos(angle + Math.PI / 2) * wobble, cy + Math.sin(angle) * len + Math.sin(angle + Math.PI / 2) * wobble);
+    ctx.stroke();
   }
   ctx.restore();
 }
@@ -1668,7 +1951,9 @@ function createSpecialTemplate(type = pickSpecialType(state.rng)) {
     type,
     cell: null,
     placed: false,
-    effectTimer: 0
+    effectTimer: 0,
+    cooldown: 0,
+    flashTimer: 0
   };
 }
 
@@ -1678,21 +1963,25 @@ function cloneSpecial(special) {
     type: special.type,
     cell: special.cell ? { ...special.cell } : null,
     placed: special.placed,
-    effectTimer: 0
+    effectTimer: 0,
+    cooldown: special.cooldown || 0,
+    flashTimer: 0
   };
 }
 
 function pickSpecialType(rng) {
   const roll = rng();
-  if (roll < 0.5) return "radius";
-  if (roll < 0.75) return "row";
+  if (roll < 0.25) return "radius";
+  if (roll < 0.5) return "lightning";
+  if (roll < 0.75) return "gravity";
+  if (roll < 0.875) return "row";
   return "column";
 }
 
 function isPointInsideSpecial(pos, special) {
   if (!special?.placed || !special.cell) return false;
   const { x, y } = special.cell;
-  if (special.type === "radius") {
+  if (special.type === "radius" || special.type === "gravity" || special.type === "lightning") {
     const dx = pos.x - (x + 0.5);
     const dy = pos.y - (y + 0.5);
     return Math.hypot(dx, dy) <= SPECIAL_RADIUS;
@@ -1757,19 +2046,12 @@ function hexToRgb(hex) {
   };
 }
 
-  if (!ctx.roundRect) {
-    ctx.beginPath();
-    ctx.moveTo(6 + 8, 6);
-    ctx.lineTo(6 + size - 8, 6);
-    ctx.quadraticCurveTo(6 + size, 6, 6 + size, 6 + 8);
-    ctx.lineTo(6 + size, 6 + size - 8);
-    ctx.quadraticCurveTo(6 + size, 6 + size, 6 + size - 8, 6 + size);
-    ctx.lineTo(6 + 8, 6 + size);
-    ctx.quadraticCurveTo(6, 6 + size, 6, 6 + size - 8);
-    ctx.lineTo(6, 6 + 8);
-    ctx.quadraticCurveTo(6, 6, 6 + 8, 6);
-    ctx.closePath();
-  } else {
-    ctx.beginPath();
-    ctx.roundRect(6, 6, size, size, 8);
+function decayGravityOffset(offset, delta) {
+  if (!offset) return null;
+  const decay = Math.pow(0.5, delta / 2); // ~2s half-life
+  const next = { x: offset.x * decay, y: offset.y * decay };
+  if (Math.abs(next.x) < 0.001 && Math.abs(next.y) < 0.001) {
+    return null;
   }
+  return next;
+}
