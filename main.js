@@ -12,7 +12,7 @@ const VIEW_GAP = 0;
 const CANVAS_WIDTH = VIEW_RENDER_WIDTH * 2 + VIEW_GAP;
 const CANVAS_HEIGHT = VIEW_HEIGHT;
 const BUILD_DURATION = 60 * 1000; // ms
-const NPC_SPEED = 2.5;
+const NPC_SPEED = 3;
 const NPC_RADIUS = 0.35;
 const PAD_PULSE_PERIOD = 3.5;
 const ENTRANCE_X = Math.floor(GRID_SIZE / 2);
@@ -53,6 +53,7 @@ const seedInput = document.getElementById("seedInput");
 const newGameBtn = document.getElementById("newGame");
 const randomSeedBtn = document.getElementById("randomSeed");
 const setSeedBtn = document.getElementById("setSeed");
+const editRetryBtn = document.getElementById("editRetry");
 const timerEl = document.getElementById("timer");
 const timerStatusEl = document.getElementById("timerStatus");
 const statusBoard = document.getElementById("statusBoard");
@@ -78,6 +79,7 @@ const resultCard = resultPopup?.querySelector(".result-card");
 const popupMessageEl = document.getElementById("popupMessage");
 const popupEmojiEl = document.getElementById("popupEmoji");
 const popupCloseBtn = document.getElementById("closePopup");
+const shareResultBtn = document.getElementById("shareResult");
 
 const state = {
   rng: mulberry32(1),
@@ -125,6 +127,7 @@ function setupListeners() {
     }
     startGame(value);
   });
+  editRetryBtn?.addEventListener("click", editAndRetry);
   wallsCard?.addEventListener("click", () => {
     if (!state.building || state.coins <= 0) return;
     setBuildMode("normal");
@@ -150,6 +153,7 @@ function setupListeners() {
     showMainMenu();
     hidePause();
   });
+  shareResultBtn?.addEventListener("click", handleShareResult);
   document.addEventListener("keydown", (evt) => {
     if (evt.key === "Escape" && state.mode === "game") {
       if (state.paused) resumeGame();
@@ -189,6 +193,18 @@ function startGame(seedText) {
   state.mode = "game";
   state.paused = false;
   hud.classList.remove("hidden");
+}
+
+function editAndRetry() {
+  if (!state.seed) return;
+  state.building = true;
+  state.buildTimeLeft = BUILD_DURATION / 1000;
+  state.waitingForSpecial = false;
+  state.race = null;
+  state.results = { player: null, ai: null, winner: null };
+  updatePhaseLabel("Phase: Build");
+  hideResultPopup();
+  updateHud();
 }
 
 function startFromMenu() {
@@ -1159,6 +1175,40 @@ function handlePopupBackdrop(evt) {
   }
 }
 
+function handleShareResult() {
+  const shareText = buildShareText();
+  if (!shareText) return;
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(shareText).catch(() => fallbackShare(shareText));
+  } else {
+    fallbackShare(shareText);
+  }
+}
+
+function buildShareText() {
+  const player = state.results.player;
+  const ai = state.results.ai;
+  if (player == null || ai == null) return `Seed: ${state.seed || "unknown"}`;
+  const diff = player - ai;
+  const pace = `${diff >= 0 ? "+" : ""}${diff.toFixed(2)}`;
+  return `Pace ${pace} (Seed: ${state.seed || "unknown"})`;
+}
+
+function fallbackShare(text) {
+  const temp = document.createElement("textarea");
+  temp.value = text;
+  temp.setAttribute("readonly", "");
+  temp.style.position = "absolute";
+  temp.style.left = "-9999px";
+  document.body.appendChild(temp);
+  temp.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    document.body.removeChild(temp);
+  }
+}
+
 function notifySpecialNeeded() {
   const x = CANVAS_WIDTH / 2;
   const y = 50;
@@ -1175,7 +1225,6 @@ function showMainMenu() {
   state.mode = "menu";
   state.paused = true;
   hud.classList.add("hidden");
-  statusBoard?.classList.add("hidden");
   menuOverlay.classList.remove("hidden");
   pauseOverlay.classList.add("hidden");
   updateHud();
@@ -1184,7 +1233,6 @@ function showMainMenu() {
 function hideMainMenu() {
   state.mode = "game";
   hud.classList.remove("hidden");
-  statusBoard?.classList.remove("hidden");
   menuOverlay.classList.add("hidden");
   updateHud();
 }

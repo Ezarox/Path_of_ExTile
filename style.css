@@ -19,7 +19,7 @@ html, body {
 
 .hud {
   width: 100%;
-  max-width: 720px;
+  max-width: 860px;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
@@ -68,6 +68,14 @@ html, body {
 
 .controls button#randomSeed {
   background: #3b58ff;
+}
+
+.controls button#editRetry {
+  background: #8847ff;
+}
+
+.controls button#editRetry:hover {
+  background: #6831c3;
 }
 
 .controls button#setSeed {
@@ -147,10 +155,6 @@ canvas#game {
   flex-direction: column;
   align-items: center;
   gap: 14px;
-}
-
-.status-board.hidden {
-  display: none;
 }
 
 .timer-panel {
@@ -278,7 +282,7 @@ canvas#game {
   min-width: 280px;
 }
 
-.result-card button {
+.result-card button.close-popup {
   position: absolute;
   top: 12px;
   right: 12px;
@@ -287,6 +291,25 @@ canvas#game {
   color: #fff;
   font-size: 20px;
   cursor: pointer;
+}
+
+.share-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 12px auto 0;
+  padding: 6px 14px;
+  border-radius: 6px;
+  background: #2ba84a;
+  border: none;
+  color: #fff;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.share-button:hover {
+  background: #21813a;
 }
 
 .result-emoji {
