@@ -202,9 +202,23 @@ function editAndRetry() {
   state.waitingForSpecial = false;
   state.race = null;
   state.results = { player: null, ai: null, winner: null };
+  resetPadStates(state.playerGrid);
+  resetPadStates(state.aiGrid);
+  if (state.playerSpecial) state.playerSpecial.effectTimer = 0;
+  if (state.aiSpecial) state.aiSpecial.effectTimer = 0;
   updatePhaseLabel("Phase: Build");
   hideResultPopup();
   updateHud();
+}
+
+function resetPadStates(grid) {
+  if (!grid) return;
+  for (let y = 0; y < GRID_SIZE; y++) {
+    for (let x = 0; x < GRID_SIZE; x++) {
+      if (grid[y][x] === CELL_SPEED_USED) grid[y][x] = CELL_SPEED;
+      else if (grid[y][x] === CELL_SLOW_USED) grid[y][x] = CELL_SLOW;
+    }
+  }
 }
 
 function startFromMenu() {
