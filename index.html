@@ -45,12 +45,22 @@
           </div>
           <div class="mini-value" id="wallsValue">--</div>
         </button>
+        <button id="singleCard" class="mini-card single" type="button">
+          <div class="panel-header">
+            <div class="panel-title">SINGLE</div>
+            <span class="panel-line"></span>
+          </div>
+          <div class="mini-value" id="singleValue">--</div>
+        </button>
         <button id="specialCard" class="mini-card special" type="button">
           <div class="panel-header">
             <div class="panel-title">SPECIAL</div>
             <span class="panel-line"></span>
           </div>
-          <div class="mini-value" id="specialValue">--</div>
+          <div class="special-preview">
+            <canvas id="specialPreview" width="30" height="30"></canvas>
+            <span id="specialValue" class="sr-only">--</span>
+          </div>
         </button>
       </div>
     </div>
@@ -68,15 +78,11 @@
         <button id="newGame" type="button">Restart</button>
         <button id="editRetry" type="button">Edit & Retry</button>
         <button id="menuButton" type="button">Main Menu</button>
-      </div>
-      <div class="stats">
-        <span id="phase">Phase: --</span>
-        <span id="score">Score: --</span>
-        <span id="specialInfo">Special: --</span>
+        <button id="catalogueButton" type="button" class="catalogue-button">Catalogue</button>
       </div>
       <div class="hud-notes">
         <p>
-          Place 2x2 walls during the build phase (your pool changes every round). Right-click walls to refund them, or use the Special card to place your single unique structure.
+          Spend your WALLS card on chunky 2x2 blockers, use the SINGLE card for precise 1x1 plugs, and drop the SPECIAL to lock in your signature trap. Right-click placed walls or singles to refund them.
         </p>
       </div>
     </section>
@@ -87,6 +93,16 @@
         <div id="popupEmoji" class="result-emoji">&#128578;</div>
         <p id="popupMessage">You win!</p>
         <button id="shareResult" class="share-button" type="button">Share Result</button>
+      </div>
+    </div>
+
+    <div id="catalogueOverlay" class="catalogue-overlay hidden">
+      <div class="catalogue-card">
+        <div class="catalogue-header">
+          <h2>Catalogue</h2>
+          <button id="closeCatalogue" aria-label="Close catalogue">&#215;</button>
+        </div>
+        <div class="catalogue-list" id="catalogueList"></div>
       </div>
     </div>
   <script src="main.js"></script>
