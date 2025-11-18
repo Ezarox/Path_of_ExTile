@@ -1002,9 +1002,11 @@ function updateRace(delta) {
     checkPanelUnderRunner(runner);
     updateSpecialArea(runner, delta);
     updateNeutralSpecialEffects(runner, delta);
-    runner.elapsedTime += timeConsumed;
+    const finishedThisFrame = runner.segmentIndex >= runner.segmentLengths.length;
+    const frameContribution = finishedThisFrame ? Math.min(timeConsumed, delta) : delta;
+    runner.elapsedTime += frameContribution;
     updatePadEffectStates(runner);
-    if (runner.segmentIndex >= runner.segmentLengths.length) {
+    if (finishedThisFrame) {
       runner.finished = true;
       runner.resultTime = runner.elapsedTime;
       recordResult(runner, runner.resultTime);
