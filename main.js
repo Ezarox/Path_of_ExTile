@@ -62,6 +62,48 @@ const SPECIAL_BEAM_WEIGHT = 1.2;
 const SPECIAL_GRAVITY_WEIGHT = 0.9;
 const SPECIAL_LIGHTNING_WEIGHT = 2.5;
 const AI_PATH_WEIGHT = 12;
+const PAD_SLOW_EXTRA_TIME = PANEL_EFFECT_DURATION * (1 / PANEL_SLOW_MULT - 1);
+const PAD_SPEED_TIME_DELTA = PANEL_EFFECT_DURATION * (1 - 1 / PANEL_FAST_MULT);
+const PAD_STONE_EXTRA_TIME = 2 * (1 / MEDUSA_SLOW_MULT - 1);
+const PAD_TIME_TO_DISTANCE = NPC_SPEED;
+const SPECIAL_PLACEMENT_BONUS = 1.8;
+const SPECIAL_HOTSPOT_LIMIT = 5;
+const SPECIAL_HOTSPOT_TOLERANCE = 35;
+const SPECIAL_PATH_GAIN_THRESHOLD = 10;
+const SPECIAL_RADIUS_TIME_PER_TILE =
+  (FREEZING_BUILDUP / 2) * (1 / ((SPECIAL_SLOW_MULT + FREEZING_MIN_MULT) / 2) - 1);
+const SPECIAL_BEAM_TIME_PER_TILE = SPECIAL_LINGER * (1 / SPECIAL_SLOW_MULT - 1);
+const SPECIAL_GRAVITY_TIME_PER_TILE =
+  SPECIAL_LINGER * (1 / ((GRAVITY_MIN_MULT + GRAVITY_MAX_MULT) / 2) - 1);
+const SPECIAL_LIGHTNING_TIME = LIGHTNING_STUN;
+const SPECIAL_PAD_SYNERGY_TIME = PANEL_EFFECT_DURATION * (1 / PANEL_SLOW_MULT - 1);
+const SPECIAL_PAD_SYNERGY_STRONG_TIME = SPECIAL_PAD_SYNERGY_TIME * 1.25;
+const SPECIAL_NEUTRAL_OVERLAP_TIME = SPECIAL_LINGER * (1 / SPECIAL_SLOW_MULT - 1) * 0.75;
+const BENEFICIAL_PAD_TYPES = ["slow", "detour", "stone", "rewind"];
+const PAD_UNVISITED_PENALTY_BASE = PAD_SLOW_EXTRA_TIME * 0.35;
+const AI_WEIGHT_DEFAULTS = {
+  padTime: 0.0001,
+  specialTime: 2.46,
+  neutralSpecialTime: 0.255,
+  padCoverage: 0,
+  padCoveragePenalty: PAD_UNVISITED_PENALTY_BASE * 2.681,
+  slowInteraction: 0.014
+};
+const aiWeights = { ...AI_WEIGHT_DEFAULTS };
+const EARLY_PATH_CELLS = 35;
+const SPEED_DIVERSION_RADIUS = 3;
+const QUICK_REVIEW_TRIGGER = 4;
+const PLACEMENT_LOOKAHEAD_COUNT = 2;
+const LOOKAHEAD_BUDGET = 4;
+const LOOKAHEAD_INTERVAL = 4;
+const LOOKAHEAD_TRIGGER_THRESHOLD = 0.02;
+const PLACEMENT_LOOKAHEAD_WEIGHT = 0.2;
+const CARDINAL_NEIGHBORS = [
+  [1, 0],
+  [-1, 0],
+  [0, 1],
+  [0, -1]
+];
 const BUILD_MODE_ORDER = ["normal", "single", "special"];
 
 const MOVES = [
@@ -771,55 +813,113 @@ function startRace(forceStart = false) {
 function buildAiLayout() {
   const grid = cloneGrid(state.baseGrid);
   const special = createSpecialTemplate(state.specialTemplate.type);
-  const tries = state.coinBudget;
-  let currentScore = evaluateGridForAi(grid);
-  for (let i = 0; i < tries; i++) {
-    const placement = findBestAiPlacement(grid, currentScore);
+  const neutralSpecials = state.baseNeutralSpecials || [];
+  const specialHotspots = computeSpecialHotspots(grid, special, neutralSpecials);
+  let wallsLeft = state.coinBudget;
+  let singlesLeft = state.singleBudget || 0;
+  let currentScore = evaluateGridForAi(grid, special, neutralSpecials);
+  const lookaheadState = {
+    remaining: LOOKAHEAD_BUDGET,
+    interval: LOOKAHEAD_INTERVAL,
+    index: 0
+  };
+  const maxIterations = Math.max(1, wallsLeft + singlesLeft);
+  for (let i = 0; i < maxIterations; i++) {
+    if (wallsLeft <= 0 && singlesLeft <= 0) break;
+    const placement = findBestAiPlacement(
+      grid,
+      currentScore,
+      special,
+      neutralSpecials,
+      wallsLeft > 0,
+      singlesLeft > 0,
+      null,
+      lookaheadState
+    );
     if (!placement) break;
-    placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
-    ensureOpenings(grid);
+    if (placement.type === "wall" && wallsLeft > 0) {
+      placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
+      ensureOpenings(grid);
+      wallsLeft--;
+    } else if (placement.type === "single" && singlesLeft > 0) {
+      grid[placement.y][placement.x] = CELL_SINGLE;
+      ensureOpenings(grid);
+      singlesLeft--;
+    } else {
+      break;
+    }
     currentScore = placement.score;
+    if (wallsLeft + singlesLeft <= QUICK_REVIEW_TRIGGER) {
+      currentScore = quickPlacementReview(grid, special, neutralSpecials, currentScore);
+    }
   }
-  let singleScore = currentScore;
-  for (let i = 0; i < (state.singleBudget || 0); i++) {
-    const single = findBestAiSinglePlacement(grid, singleScore);
-    if (!single) break;
-    grid[single.y][single.x] = CELL_SINGLE;
-    ensureOpenings(grid);
-    singleScore = single.score;
-  }
-  placeAiSpecial(grid, special);
+  currentScore = refineAiLayout(grid, special, neutralSpecials, currentScore);
+  placeAiSpecial(grid, special, neutralSpecials, specialHotspots);
   return { grid, special };
 }
 
-function findBestAiPlacement(grid, currentScore) {
+function findBestAiPlacement(
+  grid,
+  currentScore,
+  special,
+  neutralSpecials,
+  allowWalls = true,
+  allowSingles = true,
+  forcedSingleCells = null,
+  lookaheadState = null
+) {
+  if (lookaheadState) {
+    lookaheadState.index = (lookaheadState.index || 0) + 1;
+  }
+  const lookaheadEnabled =
+    lookaheadState?.remaining > 0 &&
+    (lookaheadState.interval || 1) > 0 &&
+    lookaheadState.index % (lookaheadState.interval || 1) === 0 &&
+    lookaheadState.remaining <= PLACEMENT_LOOKAHEAD_COUNT;
+  const candidateLimit = lookaheadEnabled ? PLACEMENT_LOOKAHEAD_COUNT : 1;
+  const candidates = [];
+  if (allowWalls) {
+    candidates.push(
+      ...findTopAiWallCandidates(grid, special, neutralSpecials, candidateLimit)
+    );
+  }
+  if (allowSingles) {
+    const steerCells = collectSpeedPadSteerCells(grid);
+    const forced =
+      forcedSingleCells && forcedSingleCells.length
+        ? forcedSingleCells.concat(steerCells)
+        : steerCells;
+    candidates.push(
+      ...findTopAiSingleCandidates(grid, special, neutralSpecials, forced, candidateLimit)
+    );
+  }
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  const topCandidate = candidates[0];
+  const second = candidates[1];
+  const shouldLookahead =
+    lookaheadEnabled &&
+    second &&
+    Math.abs(topCandidate.score - second.score) <=
+      Math.max(1, Math.abs(topCandidate.score)) * LOOKAHEAD_TRIGGER_THRESHOLD;
+  if (!shouldLookahead) {
+    return topCandidate;
+  }
+  lookaheadState.remaining--;
+  const top = candidates.slice(0, PLACEMENT_LOOKAHEAD_COUNT);
   let best = null;
-  const basePath = computePath(grid);
-  const targeted = [];
-  basePath.forEach((node) => {
-    for (const [ox, oy] of [
-      [-1, -1],
-      [0, -1],
-      [-1, 0],
-      [0, 0]
-    ]) {
-      targeted.push({ x: node.x + ox, y: node.y + oy });
+  top.forEach((candidate) => {
+    const lookahead = evaluateCandidateWithLookahead(grid, special, neutralSpecials, candidate);
+    candidate.lookaheadScore = lookahead;
+    if (
+      !best ||
+      lookahead > best.lookaheadScore ||
+      (lookahead === best.lookaheadScore && candidate.score > best.score)
+    ) {
+      best = candidate;
     }
   });
-  const candidates = targeted.concat(generateRandomCandidates(grid, 160));
-  for (const cand of candidates) {
-    if (!canPlaceBlock(grid, cand.x, cand.y)) continue;
-    placeBlock(grid, cand.x, cand.y, CELL_PLAYER);
-    ensureOpenings(grid);
-    const score = evaluateGridForAi(grid);
-    clearBlock(grid, cand.x, cand.y);
-    ensureOpenings(grid);
-    if (score === -Infinity || score < currentScore) continue;
-    if (!best || score > best.score) {
-      best = { x: cand.x, y: cand.y, score };
-    }
-  }
-  return best;
+  return best || topCandidate;
 }
 
 function generateRandomCandidates(grid, count) {
@@ -833,34 +933,73 @@ function generateRandomCandidates(grid, count) {
   return results;
 }
 
-function findBestAiSinglePlacement(grid, currentScore) {
-  let best = null;
+function findTopAiWallCandidates(grid, special, neutralSpecials, limit = 1) {
+  const results = [];
   const basePath = computePath(grid);
-  const candidates = new Set();
+  const targeted = [];
   basePath.forEach((node) => {
-    candidates.add(key(node.x, node.y));
+    for (const [ox, oy] of [
+      [-1, -1],
+      [0, -1],
+      [-1, 0],
+      [0, 0]
+    ]) {
+      targeted.push({ x: node.x + ox, y: node.y + oy });
+    }
+  });
+  const wallCandidates = targeted.concat(generateRandomCandidates(grid, 160));
+  wallCandidates.forEach((cand) => {
+    if (!canPlaceBlock(grid, cand.x, cand.y)) return;
+    placeBlock(grid, cand.x, cand.y, CELL_PLAYER);
+    ensureOpenings(grid);
+    const score = evaluateGridForAi(grid, special, neutralSpecials);
+    clearBlock(grid, cand.x, cand.y);
+    ensureOpenings(grid);
+    if (!Number.isFinite(score)) return;
+    insertCandidate(results, { type: "wall", x: cand.x, y: cand.y, score }, limit);
+  });
+  return results;
+}
+
+function findTopAiSingleCandidates(
+  grid,
+  special,
+  neutralSpecials,
+  forcedCells = null,
+  limit = 1
+) {
+  const basePath = computePath(grid);
+  const singleCandidates = new Set();
+  basePath.forEach((node) => {
+    singleCandidates.add(key(node.x, node.y));
     MOVES.forEach((move) => {
       const nx = node.x + move.dx;
       const ny = node.y + move.dy;
-      if (isInsideGrid(nx, ny)) candidates.add(key(nx, ny));
+      if (isInsideGrid(nx, ny)) singleCandidates.add(key(nx, ny));
     });
   });
   const extras = generateRandomSingleCandidates(160);
-  extras.forEach((c) => candidates.add(key(c.x, c.y)));
-  for (const entry of candidates) {
+  extras.forEach((c) => singleCandidates.add(key(c.x, c.y)));
+  if (forcedCells?.length) {
+    forcedCells.forEach((cell) => {
+      if (cell && isInsideGrid(cell.x, cell.y)) {
+        singleCandidates.add(key(cell.x, cell.y));
+      }
+    });
+  }
+  const results = [];
+  for (const entry of singleCandidates) {
     const [cx, cy] = entry.split(",").map(Number);
     if (!canPlaceSingle(grid, cx, cy)) continue;
     grid[cy][cx] = CELL_SINGLE;
     ensureOpenings(grid);
-    const score = evaluateGridForAi(grid);
+    const score = evaluateGridForAi(grid, special, neutralSpecials);
     grid[cy][cx] = CELL_EMPTY;
     ensureOpenings(grid);
-    if (score === -Infinity || score < currentScore) continue;
-    if (!best || score > best.score) {
-      best = { x: cx, y: cy, score };
-    }
+    if (!Number.isFinite(score)) continue;
+    insertCandidate(results, { type: "single", x: cx, y: cy, score }, limit);
   }
-  return best;
+  return results;
 }
 
 function generateRandomSingleCandidates(count) {
@@ -874,9 +1013,514 @@ function generateRandomSingleCandidates(count) {
   return out;
 }
 
-function placeAiSpecial(grid, special) {
+function collectSpeedPadSteerCells(grid) {
+  const path = computePath(grid);
+  if (!path.length) return [];
+  const cells = new Set();
+  path.forEach((node) => {
+    if (grid[node.y]?.[node.x] !== CELL_SPEED) return;
+    CARDINAL_NEIGHBORS.forEach(([dx, dy]) => {
+      const nx = node.x + dx;
+      const ny = node.y + dy;
+      if (!isInsideGrid(nx, ny)) return;
+      if (!canPlaceSingle(grid, nx, ny)) return;
+      cells.add(key(nx, ny));
+    });
+  });
+  return Array.from(cells).map((entry) => {
+    const [x, y] = entry.split(",").map(Number);
+    return { x, y };
+  });
+}
+
+function evaluateCandidateWithLookahead(grid, special, neutralSpecials, candidate) {
+  const baseScore = candidate.score;
+  applyPlacementCandidate(grid, candidate);
+  const followWalls = findTopAiWallCandidates(grid, special, neutralSpecials, 1);
+  const followSingles = findTopAiSingleCandidates(
+    grid,
+    special,
+    neutralSpecials,
+    collectSpeedPadSteerCells(grid),
+    1
+  );
+  const follow = followWalls.concat(followSingles);
+  follow.sort((a, b) => b.score - a.score);
+  const bestFollow = follow.length ? follow[0].score : baseScore;
+  revertPlacementCandidate(grid, candidate);
+  const bonus = Math.max(0, bestFollow - baseScore) * PLACEMENT_LOOKAHEAD_WEIGHT;
+  return baseScore + bonus;
+}
+
+function applyPlacementCandidate(grid, candidate) {
+  if (candidate.type === "wall") {
+    placeBlock(grid, candidate.x, candidate.y, CELL_PLAYER);
+  } else {
+    grid[candidate.y][candidate.x] = CELL_SINGLE;
+  }
+  ensureOpenings(grid);
+}
+
+function revertPlacementCandidate(grid, candidate) {
+  if (candidate.type === "wall") {
+    clearBlock(grid, candidate.x, candidate.y);
+  } else {
+    grid[candidate.y][candidate.x] = CELL_EMPTY;
+  }
+  ensureOpenings(grid);
+}
+
+function insertCandidate(list, candidate, limit) {
+  if (!candidate) return;
+  list.push(candidate);
+  list.sort((a, b) => b.score - a.score);
+  if (list.length > limit) {
+    list.length = limit;
+  }
+}
+
+function refineAiLayout(grid, special, neutralSpecials, currentScore) {
+  let score = currentScore;
+  score = runStructureRefinement(grid, special, neutralSpecials, score);
+  score = reduceMandatorySpeedPads(grid, special, neutralSpecials, score);
+  return score;
+}
+
+function runStructureRefinement(grid, special, neutralSpecials, currentScore) {
+  let score = currentScore;
+  const iterations = 4;
+  for (let i = 0; i < iterations; i++) {
+    const pathInfo = analyzePath(grid);
+    const earlySet = buildEarlyPathSet(pathInfo?.path);
+    const wallResult = tryRepositionAiWall(grid, special, neutralSpecials, score, earlySet);
+    if (wallResult.changed) score = wallResult.score;
+    const singleResult = tryRepositionAiSingle(grid, special, neutralSpecials, score, earlySet);
+    if (singleResult.changed) score = singleResult.score;
+  }
+  return score;
+}
+
+function quickPlacementReview(grid, special, neutralSpecials, currentScore) {
+  const pathInfo = analyzePath(grid);
+  if (!pathInfo?.path?.length) return currentScore;
+  const earlySet = buildEarlyPathSet(pathInfo.path);
+  const wallResult = tryRepositionAiWall(
+    grid,
+    special,
+    neutralSpecials,
+    currentScore,
+    earlySet
+  );
+  let score = wallResult.changed ? wallResult.score : currentScore;
+  const singleResult = tryRepositionAiSingle(
+    grid,
+    special,
+    neutralSpecials,
+    score,
+    earlySet
+  );
+  if (singleResult.changed) score = singleResult.score;
+  return score;
+}
+
+function buildEarlyPathSet(path) {
+  if (!path?.length) return null;
+  const limit = Math.min(path.length, EARLY_PATH_CELLS);
+  const set = new Set();
+  for (let i = 0; i < limit; i++) {
+    const node = path[i];
+    set.add(keyFor(node.x, node.y));
+  }
+  return set;
+}
+
+function tryRepositionAiWall(grid, special, neutralSpecials, currentScore, preferredCells) {
+  const walls = listAiWallOrigins(grid, preferredCells);
+  if (!walls.length) return { changed: false, score: currentScore };
+  const idx = randomInt(state.rng, 0, walls.length - 1);
+  const { x, y } = walls[idx];
+  clearBlock(grid, x, y);
+  ensureOpenings(grid);
+  if (!hasPath(grid)) {
+    placeBlock(grid, x, y, CELL_PLAYER);
+    ensureOpenings(grid);
+    return { changed: false, score: currentScore };
+  }
+  const placement = findBestAiPlacement(
+    grid,
+    currentScore,
+    special,
+    neutralSpecials,
+    true,
+    false,
+    null,
+    null
+  );
+  if (placement && placement.type === "wall" && placement.score > currentScore) {
+    placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
+    ensureOpenings(grid);
+    return { changed: true, score: placement.score };
+  }
+  placeBlock(grid, x, y, CELL_PLAYER);
+  ensureOpenings(grid);
+  return { changed: false, score: currentScore };
+}
+
+function tryRepositionAiSingle(grid, special, neutralSpecials, currentScore, preferredCells) {
+  const singles = listAiSingleCells(grid, preferredCells);
+  if (!singles.length) return { changed: false, score: currentScore };
+  const idx = randomInt(state.rng, 0, singles.length - 1);
+  const { x, y } = singles[idx];
+  grid[y][x] = CELL_EMPTY;
+  ensureOpenings(grid);
+  if (!hasPath(grid)) {
+    grid[y][x] = CELL_SINGLE;
+    ensureOpenings(grid);
+    return { changed: false, score: currentScore };
+  }
+  const placement = findBestAiPlacement(
+    grid,
+    currentScore,
+    special,
+    neutralSpecials,
+    false,
+    true,
+    null,
+    null
+  );
+  if (placement && placement.type === "single" && placement.score > currentScore) {
+    grid[placement.y][placement.x] = CELL_SINGLE;
+    ensureOpenings(grid);
+    return { changed: true, score: placement.score };
+  }
+  grid[y][x] = CELL_SINGLE;
+  ensureOpenings(grid);
+  return { changed: false, score: currentScore };
+}
+
+function listAiWallOrigins(grid, preferredCells) {
+  const walls = [];
+  const preferred = preferredCells || null;
+  for (let y = 0; y < GRID_SIZE - 1; y++) {
+    for (let x = 0; x < GRID_SIZE - 1; x++) {
+      if (
+        grid[y][x] === CELL_PLAYER &&
+        grid[y + 1][x] === CELL_PLAYER &&
+        grid[y][x + 1] === CELL_PLAYER &&
+        grid[y + 1][x + 1] === CELL_PLAYER
+      ) {
+        const cellKey = keyFor(x, y);
+        if (!preferred || preferred.has(cellKey)) {
+          walls.push({ x, y });
+        }
+      }
+    }
+  }
+  if (!walls.length && preferred) {
+    return listAiWallOrigins(grid, null);
+  }
+  return walls;
+}
+
+function listAiSingleCells(grid, preferredCells) {
+  const singles = [];
+  const preferred = preferredCells || null;
+  for (let y = 0; y < GRID_SIZE; y++) {
+    for (let x = 0; x < GRID_SIZE; x++) {
+      if (grid[y][x] === CELL_SINGLE) {
+        if (!preferred || preferred.has(keyFor(x, y))) {
+          singles.push({ x, y });
+        }
+      }
+    }
+  }
+  if (!singles.length && preferred) {
+    return listAiSingleCells(grid, null);
+  }
+  return singles;
+}
+
+function reduceMandatorySpeedPads(grid, special, neutralSpecials, currentScore) {
+  let score = currentScore;
+  const mandatoryPads = collectMandatorySpeedPads(grid);
+  mandatoryPads.forEach((pad) => {
+    const result = tryDivertSpeedPad(grid, special, neutralSpecials, score, pad);
+    if (result.changed) score = result.score;
+  });
+  return score;
+}
+
+function collectMandatorySpeedPads(grid) {
+  const info = analyzePath(grid);
+  if (!info?.path?.length) return [];
+  const pads = [];
+  info.path.forEach((node) => {
+    if (!isInsideGrid(node.x, node.y)) return;
+    const value = grid[node.y]?.[node.x];
+    if (padTypeFromCell(value) === "speed" && padIsMandatory(grid, node.x, node.y)) {
+      pads.push({ x: node.x, y: node.y });
+    }
+  });
+  return pads;
+}
+
+function tryDivertSpeedPad(grid, special, neutralSpecials, currentScore, pad) {
+  const singles = listAiSingleCells(grid, buildDiversionPreferenceSet(pad));
+  if (!singles.length) return { changed: false, score: currentScore };
+  const forcedCells = getDiversionCandidates(grid, pad.x, pad.y);
+  if (!forcedCells.length) return { changed: false, score: currentScore };
+  for (const single of singles) {
+    grid[single.y][single.x] = CELL_EMPTY;
+    ensureOpenings(grid);
+    if (!hasPath(grid)) {
+      grid[single.y][single.x] = CELL_SINGLE;
+      ensureOpenings(grid);
+      continue;
+    }
+    const placement = findBestAiPlacement(
+      grid,
+      currentScore,
+      special,
+      neutralSpecials,
+      false,
+      true,
+      forcedCells,
+      { remaining: 1 }
+    );
+    if (placement && placement.type === "single" && placement.score > currentScore) {
+      grid[placement.y][placement.x] = CELL_SINGLE;
+      ensureOpenings(grid);
+      return { changed: true, score: placement.score };
+    }
+    grid[single.y][single.x] = CELL_SINGLE;
+    ensureOpenings(grid);
+  }
+  return { changed: false, score: currentScore };
+}
+
+function buildDiversionPreferenceSet(pad) {
+  const set = new Set();
+  for (let dy = -SPEED_DIVERSION_RADIUS; dy <= SPEED_DIVERSION_RADIUS; dy++) {
+    for (let dx = -SPEED_DIVERSION_RADIUS; dx <= SPEED_DIVERSION_RADIUS; dx++) {
+      const x = pad.x + dx;
+      const y = pad.y + dy;
+      if (!isInsideGrid(x, y)) continue;
+      set.add(keyFor(x, y));
+    }
+  }
+  return set;
+}
+
+function getDiversionCandidates(grid, px, py) {
+  const cells = [];
+  for (let dy = -SPEED_DIVERSION_RADIUS; dy <= SPEED_DIVERSION_RADIUS; dy++) {
+    for (let dx = -SPEED_DIVERSION_RADIUS; dx <= SPEED_DIVERSION_RADIUS; dx++) {
+      const x = px + dx;
+      const y = py + dy;
+      if (!isInsideGrid(x, y)) continue;
+      if (Math.abs(dx) + Math.abs(dy) === 0) continue;
+      if (grid[y][x] === CELL_EMPTY) {
+        cells.push({ x, y });
+      }
+    }
+  }
+  return cells;
+}
+
+function refineAiLayout(grid, special, neutralSpecials, currentScore) {
+  let score = currentScore;
+  score = runStructureRefinement(grid, special, neutralSpecials, score);
+  score = reduceMandatorySpeedPads(grid, special, neutralSpecials, score);
+  return score;
+}
+
+function runStructureRefinement(grid, special, neutralSpecials, currentScore) {
+  let score = currentScore;
+  const iterations = 4;
+  for (let i = 0; i < iterations; i++) {
+    const wallResult = tryRepositionAiWall(grid, special, neutralSpecials, score);
+    if (wallResult.changed) score = wallResult.score;
+    const singleResult = tryRepositionAiSingle(grid, special, neutralSpecials, score);
+    if (singleResult.changed) score = singleResult.score;
+  }
+  return score;
+}
+
+function tryRepositionAiWall(grid, special, neutralSpecials, currentScore, preferredCells = null) {
+  const walls = listAiWallOrigins(grid, preferredCells);
+  if (!walls.length) return { changed: false, score: currentScore };
+  const idx = randomInt(state.rng, 0, walls.length - 1);
+  const { x, y } = walls[idx];
+  clearBlock(grid, x, y);
+  ensureOpenings(grid);
+  if (!hasPath(grid)) {
+    placeBlock(grid, x, y, CELL_PLAYER);
+    ensureOpenings(grid);
+    return { changed: false, score: currentScore };
+  }
+  const placement = findBestAiPlacement(
+    grid,
+    currentScore,
+    special,
+    neutralSpecials,
+    true,
+    false,
+    null,
+    { remaining: 1 }
+  );
+  if (placement && placement.type === "wall" && placement.score > currentScore) {
+    placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
+    ensureOpenings(grid);
+    return { changed: true, score: placement.score };
+  }
+  placeBlock(grid, x, y, CELL_PLAYER);
+  ensureOpenings(grid);
+  return { changed: false, score: currentScore };
+}
+
+function tryRepositionAiSingle(grid, special, neutralSpecials, currentScore, preferredCells = null) {
+  const singles = listAiSingleCells(grid, preferredCells);
+  if (!singles.length) return { changed: false, score: currentScore };
+  const idx = randomInt(state.rng, 0, singles.length - 1);
+  const { x, y } = singles[idx];
+  grid[y][x] = CELL_EMPTY;
+  ensureOpenings(grid);
+  if (!hasPath(grid)) {
+    grid[y][x] = CELL_SINGLE;
+    ensureOpenings(grid);
+    return { changed: false, score: currentScore };
+  }
+  const placement = findBestAiPlacement(grid, currentScore, special, neutralSpecials, false, true);
+  if (placement && placement.type === "single" && placement.score > currentScore) {
+    grid[placement.y][placement.x] = CELL_SINGLE;
+    ensureOpenings(grid);
+    return { changed: true, score: placement.score };
+  }
+  grid[y][x] = CELL_SINGLE;
+  ensureOpenings(grid);
+  return { changed: false, score: currentScore };
+}
+
+function listAiWallOrigins(grid, preferredCells = null) {
+  const walls = [];
+  const preferred = preferredCells || null;
+  for (let y = 0; y < GRID_SIZE - 1; y++) {
+    for (let x = 0; x < GRID_SIZE - 1; x++) {
+      if (
+        grid[y][x] === CELL_PLAYER &&
+        grid[y + 1][x] === CELL_PLAYER &&
+        grid[y][x + 1] === CELL_PLAYER &&
+        grid[y + 1][x + 1] === CELL_PLAYER
+      ) {
+        const cellKey = keyFor(x, y);
+        if (!preferred || preferred.has(cellKey)) {
+          walls.push({ x, y });
+        }
+      }
+    }
+  }
+  if (!walls.length && preferred) {
+    return listAiWallOrigins(grid, null);
+  }
+  return walls;
+}
+
+function listAiSingleCells(grid, preferredCells = null) {
+  const singles = [];
+  const preferred = preferredCells || null;
+  for (let y = 0; y < GRID_SIZE; y++) {
+    for (let x = 0; x < GRID_SIZE; x++) {
+      if (grid[y][x] === CELL_SINGLE) {
+        if (!preferred || preferred.has(keyFor(x, y))) {
+          singles.push({ x, y });
+        }
+      }
+    }
+  }
+  if (!singles.length && preferred) {
+    return listAiSingleCells(grid, null);
+  }
+  return singles;
+}
+
+function reduceMandatorySpeedPads(grid, special, neutralSpecials, currentScore) {
+  let score = currentScore;
+  const mandatoryPads = collectMandatorySpeedPads(grid);
+  mandatoryPads.forEach((pad) => {
+    const result = tryDivertSpeedPad(grid, special, neutralSpecials, score, pad);
+    if (result.changed) score = result.score;
+  });
+  return score;
+}
+
+function collectMandatorySpeedPads(grid) {
+  const info = analyzePath(grid);
+  if (!info?.path?.length) return [];
+  const pads = [];
+  info.path.forEach((node) => {
+    if (!isInsideGrid(node.x, node.y)) return;
+    const value = grid[node.y]?.[node.x];
+    if (padTypeFromCell(value) === "speed" && padIsMandatory(grid, node.x, node.y)) {
+      pads.push({ x: node.x, y: node.y });
+    }
+  });
+  return pads;
+}
+
+function tryDivertSpeedPad(grid, special, neutralSpecials, currentScore, pad) {
+  const singles = listAiSingleCells(grid);
+  if (!singles.length) return { changed: false, score: currentScore };
+  const forcedCells = getDiversionCandidates(grid, pad.x, pad.y);
+  if (!forcedCells.length) return { changed: false, score: currentScore };
+  for (const single of singles) {
+    grid[single.y][single.x] = CELL_EMPTY;
+    ensureOpenings(grid);
+    if (!hasPath(grid)) {
+      grid[single.y][single.x] = CELL_SINGLE;
+      ensureOpenings(grid);
+      continue;
+    }
+    const placement = findBestAiPlacement(
+      grid,
+      currentScore,
+      special,
+      neutralSpecials,
+      false,
+      true,
+      forcedCells
+    );
+    if (placement && placement.type === "single" && placement.score > currentScore) {
+      grid[placement.y][placement.x] = CELL_SINGLE;
+      ensureOpenings(grid);
+      return { changed: true, score: placement.score };
+    }
+    grid[single.y][single.x] = CELL_SINGLE;
+    ensureOpenings(grid);
+  }
+  return { changed: false, score: currentScore };
+}
+
+function getDiversionCandidates(grid, px, py) {
+  const cells = [];
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const x = px + dx;
+      const y = py + dy;
+      if (!isInsideGrid(x, y)) continue;
+      if (Math.abs(dx) + Math.abs(dy) === 0) continue;
+      if (grid[y][x] === CELL_EMPTY) {
+        cells.push({ x, y });
+      }
+    }
+  }
+  return cells;
+}
+
+function computeSpecialHotspots(grid, special, neutralSpecials, limit = SPECIAL_HOTSPOT_LIMIT) {
   const basePath = computePath(grid);
-  if (!basePath.length) return;
+  if (!basePath.length) return [];
+  const baselineInfo = analyzePath(grid);
+  const baselineMandatory = countMandatorySpeedPads(grid, baselineInfo?.path);
   const candidates = new Set();
   basePath.forEach((node) => {
     if (node.x >= 0 && node.x < GRID_SIZE && node.y >= 0 && node.y < GRID_SIZE) {
@@ -895,32 +1539,433 @@ function placeAiSpecial(grid, special) {
     const gy = randomInt(state.rng, 1, GRID_SIZE - 2);
     candidates.add(key(gx, gy));
   }
-  let best = null;
+  const hotspots = [];
   for (const entry of candidates) {
     const [x, y] = entry.split(",").map(Number);
-    if (!isCellAvailableForSpecial(grid, x, y)) continue;
-    const original = grid[y][x];
-    grid[y][x] = CELL_SPECIAL;
-    ensureOpenings(grid);
-    const pathInfo = analyzePath(grid);
-    if (!pathInfo) {
-      grid[y][x] = original;
-      ensureOpenings(grid);
-      continue;
+    const placement = evaluateSpecialCandidate(
+      grid,
+      special,
+      neutralSpecials,
+      x,
+      y,
+      baselineInfo,
+      baselineMandatory
+    );
+    if (!placement) continue;
+    hotspots.push({ x: placement.x, y: placement.y, score: placement.score });
+  }
+  hotspots.sort((a, b) => b.score - a.score);
+  return hotspots.slice(0, limit);
+}
+
+function placeAiSpecial(grid, special, neutralSpecials, preferredCells = []) {
+  const basePath = computePath(grid);
+  if (!basePath.length) return;
+  const baselineInfo = analyzePath(grid);
+  if (!baselineInfo) return;
+  const baselineMandatory = countMandatorySpeedPads(grid, baselineInfo.path);
+  const candidates = new Set();
+  basePath.forEach((node) => {
+    if (node.x >= 0 && node.x < GRID_SIZE && node.y >= 0 && node.y < GRID_SIZE) {
+      candidates.add(key(node.x, node.y));
     }
-    const score =
-      pathInfo.totalDistance + pathInfo.padScore + scoreSpecialPlacement(pathInfo, special.type, { x, y });
+    MOVES.forEach((move) => {
+      const nx = node.x + move.dx;
+      const ny = node.y + move.dy;
+      if (nx >= 0 && nx < GRID_SIZE && ny >= 0 && ny < GRID_SIZE) {
+        candidates.add(key(nx, ny));
+      }
+    });
+  });
+  for (let i = 0; i < 120; i++) {
+    const gx = randomInt(state.rng, 0, GRID_SIZE - 1);
+    const gy = randomInt(state.rng, 1, GRID_SIZE - 2);
+    candidates.add(key(gx, gy));
+  }
+  const preferredList = (preferredCells || [])
+    .map((cell) => (cell ? { x: cell.x, y: cell.y } : null))
+    .filter(Boolean);
+  const preferredSet = new Set(preferredList.map((cell) => key(cell.x, cell.y)));
+  let bestPreferred = null;
+  preferredList.forEach((cell) => {
+    const placement = evaluateSpecialCandidate(
+      grid,
+      special,
+      neutralSpecials,
+      cell.x,
+      cell.y,
+      baselineInfo,
+      baselineMandatory
+    );
+    if (placement && (!bestPreferred || placement.score > bestPreferred.score)) {
+      bestPreferred = placement;
+    }
+  });
+  let bestGeneral = null;
+  for (const entry of candidates) {
+    if (preferredSet.has(entry)) continue;
+    const [x, y] = entry.split(",").map(Number);
+    const placement = evaluateSpecialCandidate(
+      grid,
+      special,
+      neutralSpecials,
+      x,
+      y,
+      baselineInfo,
+      baselineMandatory
+    );
+    if (!placement) continue;
+    if (!bestGeneral || placement.score > bestGeneral.score) {
+      bestGeneral = placement;
+    }
+  }
+  let best = null;
+  if (bestPreferred) {
+    const generalException =
+      bestGeneral &&
+      (bestGeneral.pathGain >= SPECIAL_PATH_GAIN_THRESHOLD || bestGeneral.avoidsSpeedPad);
+    if (generalException) {
+      best = bestGeneral;
+    } else {
+      best = bestPreferred;
+    }
+  } else {
+    best = bestGeneral;
+  }
+  if (!best) return;
+  grid[best.y][best.x] = CELL_SPECIAL;
+  special.cell = { x: best.x, y: best.y };
+  special.placed = true;
+  special.effectTimer = 0;
+  special.cooldown = 0;
+  special.flashTimer = 0;
+}
+
+function evaluateSpecialCandidate(
+  grid,
+  special,
+  neutralSpecials,
+  x,
+  y,
+  baselineInfo,
+  baselineMandatorySpeedCount
+) {
+  if (!isCellAvailableForSpecial(grid, x, y)) return null;
+  const original = grid[y][x];
+  grid[y][x] = CELL_SPECIAL;
+  ensureOpenings(grid);
+  const candidateSpecial = {
+    ...special,
+    cell: { x, y },
+    placed: true
+  };
+  const pathInfo = analyzePath(grid);
+  if (!pathInfo) {
     grid[y][x] = original;
     ensureOpenings(grid);
-    if (!best || score > best.score) {
-      best = { x, y, score };
+    return null;
+  }
+  const score = evaluateGridForAi(grid, candidateSpecial, neutralSpecials, pathInfo);
+  const mandatorySpeedCount = countMandatorySpeedPads(grid, pathInfo.path);
+  const baseDistance = baselineInfo?.totalDistance ?? 0;
+  const pathGain = pathInfo.totalDistance - baseDistance;
+  const avoidsSpeedPad =
+    typeof baselineMandatorySpeedCount === "number" &&
+    mandatorySpeedCount < baselineMandatorySpeedCount;
+  grid[y][x] = original;
+  ensureOpenings(grid);
+  if (!Number.isFinite(score)) return null;
+  return { x, y, score, pathGain, avoidsSpeedPad };
+}
+
+function simulateRunnerTime(grid, special, neutralSpecials = []) {
+  if (!grid) return null;
+  const runner = createRunner(
+    "AI",
+    cloneGrid(grid),
+    special ? cloneSpecial(special) : null,
+    cloneNeutralSpecials(neutralSpecials)
+  );
+  if (!runner.path.length) return null;
+  const maxTime = 600;
+  let elapsed = 0;
+  while (!runner.finished && elapsed < maxTime) {
+    advanceRunnerSimulation(runner, FIXED_TIMESTEP);
+    elapsed += FIXED_TIMESTEP;
+  }
+  if (!runner.finished) return null;
+  return runner.resultTime ?? runner.elapsedTime ?? elapsed;
+}
+
+function advanceRunnerSimulation(runner, delta) {
+  if (runner.finished) return;
+  if (!runner.path.length) {
+    runner.finished = true;
+    runner.resultTime = runner.elapsedTime || 0;
+    return;
+  }
+  updateRunnerEffects(runner, delta);
+  const speed = NPC_SPEED * runner.effects.speedMultiplier;
+  let remainingDistance = speed * delta;
+  let timeConsumed = 0;
+  while (remainingDistance > 0 && runner.segmentIndex < runner.segmentLengths.length) {
+    const dirVector = segmentDirectionVector(runner.path, runner.segmentIndex);
+    const dirStep = segmentStep(runner.path, runner.segmentIndex);
+    if (dirVector) {
+      runner.effects.lastDir = dirVector;
+      runner.effects.lastStep = dirStep;
+    }
+    const segmentLength = runner.segmentLengths[runner.segmentIndex] || 0;
+    if (segmentLength === 0) {
+      runner.segmentIndex++;
+      runner.segmentProgress = 0;
+      continue;
+    }
+    const segmentRemaining = segmentLength - runner.segmentProgress;
+    if (remainingDistance < segmentRemaining) {
+      runner.segmentProgress += remainingDistance;
+      timeConsumed += remainingDistance / speed;
+      remainingDistance = 0;
+    } else {
+      remainingDistance -= segmentRemaining;
+      timeConsumed += segmentRemaining / speed;
+      runner.segmentIndex++;
+      runner.segmentProgress = 0;
+      triggerPanelForRunner(runner);
     }
   }
-  if (best) {
-    grid[best.y][best.x] = CELL_SPECIAL;
-    special.cell = { x: best.x, y: best.y };
-    special.placed = true;
+  runner.worldPos = runnerWorldPosition(runner);
+  checkPanelUnderRunner(runner);
+  updateSpecialArea(runner, delta);
+  updateNeutralSpecialEffects(runner, delta);
+  const finishedThisFrame = runner.segmentIndex >= runner.segmentLengths.length;
+  const frameContribution = finishedThisFrame ? Math.min(timeConsumed, delta) : delta;
+  runner.elapsedTime += frameContribution;
+  updatePadEffectStates(runner);
+  if (finishedThisFrame) {
+    runner.finished = true;
+    runner.resultTime = runner.elapsedTime;
   }
+}
+
+function evaluateAiSeed(seed, runs = 1, silent = false) {
+  const snapshot = snapshotAiContext();
+  const iterations = Math.max(1, runs | 0);
+  const results = [];
+  for (let i = 0; i < iterations; i++) {
+    const simSeed = i === 0 ? `${seed}` : `${seed}-${i}`;
+    const rng = mulberry32(hashSeed(simSeed));
+    state.rng = rng;
+    state.seed = simSeed;
+    const baseGeneration = generateBaseGrid(rng);
+    state.baseGrid = baseGeneration.grid;
+    state.baseNeutralSpecials = baseGeneration.neutralSpecial ? [baseGeneration.neutralSpecial] : [];
+    state.neutralSpecials = state.baseNeutralSpecials.map(cloneSpecial);
+    state.coinBudget = randomInt(rng, 10, 21);
+    state.coins = state.coinBudget;
+    const singleCount = rng() < 0.1 ? 2 : 1;
+    state.singleBudget = singleCount;
+    state.singleBlocks = singleCount;
+    const specialType = pickSpecialType(rng);
+    state.specialTemplate = createSpecialTemplate(specialType);
+    state.aiGrid = null;
+    state.aiSpecial = null;
+    const layout = buildAiLayout();
+    const pathInfo = analyzePath(layout.grid);
+    const metrics = summarizeAiMetrics(simSeed, layout, pathInfo);
+    results.push(metrics);
+  }
+  restoreAiContext(snapshot);
+  if (!silent && typeof console !== "undefined" && console.table) {
+    console.table(results);
+  }
+  return results;
+}
+
+function evaluateSeedBatch(seedList, runs = 1) {
+  const seeds = Array.isArray(seedList)
+    ? seedList
+    : typeof seedList === "string"
+    ? seedList
+        .split(/[\s,;]+/)
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+    : [];
+  if (!seeds.length) return [];
+  const summaries = seeds.map((seed) => {
+    const results = evaluateAiSeed(seed, runs, true);
+    if (!results.length) {
+      return { seed, predictedAvg: 0, simulatedAvg: 0, bestSimulated: 0, runs: 0 };
+    }
+    const predictedAvg =
+      results.reduce((sum, entry) => sum + (entry.predictedTime || 0), 0) / results.length;
+    const simulatedAvg =
+      results.reduce((sum, entry) => sum + (entry.simulatedTime || 0), 0) / results.length;
+    const bestSimulated = Math.max(...results.map((entry) => entry.simulatedTime || 0));
+    return {
+      seed,
+      runs: results.length,
+      predictedAvg: Number(predictedAvg.toFixed(2)),
+      simulatedAvg: Number(simulatedAvg.toFixed(2)),
+      bestSimulated: Number(bestSimulated.toFixed(2))
+    };
+  });
+  if (typeof console !== "undefined" && console.table) {
+    console.table(summaries);
+  }
+  return summaries;
+}
+
+function setAiWeights(overrides = {}) {
+  Object.keys(AI_WEIGHT_DEFAULTS).forEach((key) => {
+    aiWeights[key] =
+      overrides[key] != null ? Number(overrides[key]) : Number(AI_WEIGHT_DEFAULTS[key]);
+  });
+  return { ...aiWeights };
+}
+
+function resetAiWeights() {
+  return setAiWeights({});
+}
+
+function sweepAiWeights(seed, samples = 50, options = {}) {
+  const runs = options.runs != null ? Math.max(1, options.runs | 0) : 1;
+  const ranges = {
+    padTime: 0.5,
+    specialTime: 0.5,
+    neutralSpecialTime: 0.5,
+    padCoverage: 0.5,
+    padCoveragePenalty: 0.5,
+    slowInteraction: 0.5,
+    ...options.ranges
+  };
+  const snapshot = { ...aiWeights };
+  const report = [];
+  for (let i = 0; i < samples; i++) {
+    const overrides = {
+      padTime: sampleWeight(AI_WEIGHT_DEFAULTS.padTime, ranges.padTime),
+      specialTime: sampleWeight(AI_WEIGHT_DEFAULTS.specialTime, ranges.specialTime),
+      neutralSpecialTime: sampleWeight(
+        AI_WEIGHT_DEFAULTS.neutralSpecialTime,
+        ranges.neutralSpecialTime
+      ),
+      padCoverage: sampleWeight(AI_WEIGHT_DEFAULTS.padCoverage, ranges.padCoverage),
+      padCoveragePenalty: sampleWeight(
+        AI_WEIGHT_DEFAULTS.padCoveragePenalty,
+        ranges.padCoveragePenalty
+      ),
+      slowInteraction: sampleWeight(AI_WEIGHT_DEFAULTS.slowInteraction, ranges.slowInteraction)
+    };
+    setAiWeights(overrides);
+    const results = evaluateAiSeed(seed, runs, true);
+    if (!results.length) continue;
+    const predictedAvg =
+      results.reduce((sum, entry) => sum + (entry.predictedTime || 0), 0) / results.length;
+    const simulatedAvg =
+      results.reduce((sum, entry) => sum + (entry.simulatedTime || 0), 0) / results.length;
+    const slowAvg =
+      results.reduce((sum, entry) => sum + (entry.slowTime || 0), 0) / results.length;
+    const bestSimulated = Math.max(...results.map((entry) => entry.simulatedTime || 0));
+    report.push({
+      sample: i + 1,
+      padTime: Number(aiWeights.padTime.toFixed(3)),
+      specialTime: Number(aiWeights.specialTime.toFixed(3)),
+      neutralSpecialTime: Number(aiWeights.neutralSpecialTime.toFixed(3)),
+      padCoverage: Number(aiWeights.padCoverage.toFixed(3)),
+      padCoveragePenalty: Number(aiWeights.padCoveragePenalty.toFixed(3)),
+      slowInteraction: Number(aiWeights.slowInteraction.toFixed(3)),
+      predictedAvg: Number(predictedAvg.toFixed(2)),
+      simulatedAvg: Number(simulatedAvg.toFixed(2)),
+      slowAvg: Number(slowAvg.toFixed(2)),
+      bestSimulated: Number(bestSimulated.toFixed(2))
+    });
+  }
+  Object.assign(aiWeights, snapshot);
+  if (typeof console !== "undefined" && console.table) {
+    console.table(report);
+  }
+  return report;
+}
+
+function sampleWeight(base, range = 0.25) {
+  const span = Math.max(0, Number(range));
+  const delta = (Math.random() * 2 - 1) * span;
+  return Math.max(0, base * (1 + delta));
+}
+
+function summarizeAiMetrics(seed, layout, pathInfo) {
+  if (!pathInfo) {
+    return {
+      seed,
+      distance: 0,
+      predictedTime: 0,
+      simulatedTime: null,
+      padHits: {},
+      mandatorySpeeds: 0,
+      slowTime: 0
+    };
+  }
+  const padHits = {};
+  pathInfo.path.forEach((node) => {
+    if (!isInsideGrid(node.x, node.y)) return;
+    const padType = padTypeFromCell(layout.grid[node.y]?.[node.x]);
+    if (!padType) return;
+    padHits[padType] = (padHits[padType] || 0) + 1;
+  });
+  const mandatorySpeeds = countMandatorySpeedPads(layout.grid, pathInfo.path);
+  const components = collectAiTimeComponents(layout.grid, pathInfo, layout.special, state.baseNeutralSpecials);
+  const simulated = simulateRunnerTime(layout.grid, layout.special, state.baseNeutralSpecials);
+  return {
+    seed,
+    distance: Number(pathInfo.totalDistance.toFixed(2)),
+    predictedTime: Number((pathInfo.totalDistance / NPC_SPEED).toFixed(2)),
+    simulatedTime: simulated != null ? Number(simulated.toFixed(2)) : null,
+    mandatorySpeeds,
+    padHits,
+    slowTime: Number(components.slowTime.toFixed(2)),
+    special: layout.special?.cell ? `${layout.special.type}@(${layout.special.cell.x},${layout.special.cell.y})` : "none"
+  };
+}
+
+function snapshotAiContext() {
+  return {
+    baseGrid: state.baseGrid ? cloneGrid(state.baseGrid) : null,
+    baseNeutralSpecials: state.baseNeutralSpecials?.map(cloneSpecial) || [],
+    neutralSpecials: state.neutralSpecials?.map(cloneSpecial) || [],
+    coinBudget: state.coinBudget,
+    singleBudget: state.singleBudget,
+    coins: state.coins,
+    singleBlocks: state.singleBlocks,
+    specialTemplate: state.specialTemplate ? cloneSpecial(state.specialTemplate) : null,
+    aiGrid: state.aiGrid ? cloneGrid(state.aiGrid) : null,
+    aiSpecial: state.aiSpecial ? cloneSpecial(state.aiSpecial) : null,
+    rng: state.rng,
+    seed: state.seed
+  };
+}
+
+function restoreAiContext(snapshot) {
+  if (!snapshot) return;
+  state.baseGrid = snapshot.baseGrid ? cloneGrid(snapshot.baseGrid) : null;
+  state.baseNeutralSpecials = snapshot.baseNeutralSpecials.map(cloneSpecial);
+  state.neutralSpecials = snapshot.neutralSpecials.map(cloneSpecial);
+  state.coinBudget = snapshot.coinBudget;
+  state.singleBudget = snapshot.singleBudget;
+  state.coins = snapshot.coins;
+  state.singleBlocks = snapshot.singleBlocks;
+  state.specialTemplate = snapshot.specialTemplate ? cloneSpecial(snapshot.specialTemplate) : null;
+  state.aiGrid = snapshot.aiGrid ? cloneGrid(snapshot.aiGrid) : null;
+  state.aiSpecial = snapshot.aiSpecial ? cloneSpecial(snapshot.aiSpecial) : null;
+  state.rng = snapshot.rng;
+  state.seed = snapshot.seed;
+}
+
+if (typeof window !== "undefined") {
+  window.evaluateAiSeed = evaluateAiSeed;
+  window.evaluateSeedBatch = evaluateSeedBatch;
+  window.setAiWeights = setAiWeights;
+  window.resetAiWeights = resetAiWeights;
+  window.sweepAiWeights = sweepAiWeights;
 }
 
 function createRunner(label, grid, special, neutralSpecials = []) {
@@ -2585,10 +3630,28 @@ function pathDistance(grid) {
   return path.length ? computeSegmentLengths(path).reduce((a, b) => a + b, 0) : 0;
 }
 
-function evaluateGridForAi(grid) {
-  const info = analyzePath(grid);
+function evaluateGridForAi(grid, special = null, neutralSpecials = [], pathInfoOverride = null) {
+  const info = pathInfoOverride || analyzePath(grid);
   if (!info) return -Infinity;
-  return info.totalDistance * AI_PATH_WEIGHT + info.padScore;
+  const components = collectAiTimeComponents(grid, info, special, neutralSpecials);
+  const padContribution = components.padTime * aiWeights.padTime * PAD_TIME_TO_DISTANCE;
+  const ownedSpecialContribution =
+    components.specialOwnedTime * aiWeights.specialTime * PAD_TIME_TO_DISTANCE +
+    components.specialOwnedTime * SPECIAL_PLACEMENT_BONUS;
+  const neutralSpecialContribution =
+    components.specialNeutralTime * aiWeights.neutralSpecialTime * PAD_TIME_TO_DISTANCE;
+  const coverageContribution =
+    components.coverageTime * aiWeights.padCoverage * PAD_TIME_TO_DISTANCE;
+  const interactionContribution = aiWeights.slowInteraction * components.slowTime * info.totalDistance;
+  return (
+    info.totalDistance * AI_PATH_WEIGHT +
+    info.padScore +
+    padContribution +
+    ownedSpecialContribution +
+    neutralSpecialContribution +
+    coverageContribution +
+    interactionContribution
+  );
 }
 
 function computeSegmentLengths(path) {
@@ -2625,6 +3688,307 @@ function computePadScore(grid, path) {
     }
   }
   return score;
+}
+
+function padIsMandatory(grid, x, y) {
+  if (!isInsideGrid(x, y)) return false;
+  const value = grid[y][x];
+  if (padTypeFromCell(value) !== "speed") return false;
+  const testGrid = cloneGrid(grid);
+  testGrid[y][x] = CELL_PLAYER;
+  ensureOpenings(testGrid);
+  return !hasPath(testGrid);
+}
+
+function countMandatorySpeedPads(grid, path) {
+  if (!path?.length) return 0;
+  let count = 0;
+  const checked = new Set();
+  path.forEach((node) => {
+    if (!isInsideGrid(node.x, node.y)) return;
+    const key = keyFor(node.x, node.y);
+    if (checked.has(key)) return;
+    checked.add(key);
+    const value = grid[node.y]?.[node.x];
+    if (padTypeFromCell(value) === "speed" && padIsMandatory(grid, node.x, node.y)) {
+      count++;
+    }
+  });
+  return count;
+}
+
+function computePadSlowTime(grid, pathInfo) {
+  const path = pathInfo.path;
+  const lengths = pathInfo.lengths;
+  if (!path?.length) return 0;
+  let totalTime = 0;
+  let traveled = 0;
+  for (let i = 1; i < path.length; i++) {
+    traveled += lengths[i - 1] || 0;
+    const node = path[i];
+    const prev = path[i - 1];
+    if (node.x < 0 || node.y < 0 || node.x >= GRID_SIZE || node.y >= GRID_SIZE) continue;
+    const value = grid[node.y]?.[node.x];
+    const padType = padTypeFromCell(value);
+    if (!padType) continue;
+    let penaltyTime = 0;
+    switch (padType) {
+      case "slow":
+        penaltyTime = PAD_SLOW_EXTRA_TIME;
+        break;
+      case "stone":
+        penaltyTime = PAD_STONE_EXTRA_TIME;
+        break;
+      case "speed":
+        if (padIsMandatory(grid, node.x, node.y)) {
+          penaltyTime = -PAD_SPEED_TIME_DELTA;
+        }
+        break;
+      case "detour": {
+        const forced = estimateDetourForcedDistance(grid, node, prev);
+        penaltyTime = forced / NPC_SPEED;
+        break;
+      }
+      case "rewind":
+        penaltyTime = traveled / NPC_SPEED;
+        break;
+      default:
+        penaltyTime = 0;
+        break;
+    }
+    totalTime += penaltyTime;
+  }
+  return totalTime;
+}
+
+function computePadCoveragePenaltyTime(grid, path) {
+  if (!path?.length) return 0;
+  const visited = new Set();
+  path.forEach((node) => {
+    if (!isInsideGrid(node.x, node.y)) return;
+    const padType = padTypeFromCell(grid[node.y]?.[node.x]);
+    if (padType && BENEFICIAL_PAD_TYPES.includes(padType)) {
+      visited.add(keyFor(node.x, node.y));
+    }
+  });
+  let penalty = 0;
+  for (let y = 0; y < GRID_SIZE; y++) {
+    for (let x = 0; x < GRID_SIZE; x++) {
+      const padType = padTypeFromCell(grid[y][x]);
+      if (!padType || !BENEFICIAL_PAD_TYPES.includes(padType)) continue;
+      const cellKey = keyFor(x, y);
+      if (visited.has(cellKey)) continue;
+      const dist = distanceToPath(path, x, y);
+      if (dist == null) continue;
+      const weight = dist > 12 ? 0 : Math.max(0, 1 - dist / 12);
+      penalty += weight * PAD_UNVISITED_PENALTY_BASE;
+    }
+  }
+  return -penalty;
+}
+
+function distanceToPath(path, px, py) {
+  let best = null;
+  path.forEach((node) => {
+    if (!isInsideGrid(node.x, node.y)) return;
+    const dx = node.x - px;
+    const dy = node.y - py;
+    const dist = Math.abs(dx) + Math.abs(dy);
+    if (best == null || dist < best) best = dist;
+  });
+  return best;
+}
+
+function computeSpecialUsageTimes(grid, pathInfo, special, neutralSpecials = []) {
+  const owned = estimateTimeForSpecial(grid, pathInfo, special);
+  let neutral = 0;
+  if (neutralSpecials?.length) {
+    neutralSpecials.forEach((ns) => {
+      if (!ns?.placed || !ns.cell) return;
+      neutral += estimateTimeForSpecial(grid, pathInfo, ns);
+    });
+  }
+  const padSynergy = special?.placed ? estimateSpecialPadSynergyTime(grid, pathInfo.path, special) : 0;
+  const overlap = special?.placed
+    ? estimateSpecialOverlapTime(pathInfo.path, special, neutralSpecials)
+    : 0;
+  return { owned: owned + padSynergy + overlap, neutral };
+}
+
+function estimateTimeForSpecial(grid, pathInfo, special) {
+  if (!special?.placed || !special.cell || !pathInfo?.path?.length) return 0;
+  switch (special.type) {
+    case "radius":
+      return estimateRadiusSlowTime(pathInfo, special);
+    case "row":
+      return estimateBeamSlowTime(pathInfo, special, "row");
+    case "column":
+      return estimateBeamSlowTime(pathInfo, special, "column");
+    case "gravity":
+      return estimateGravitySlowTime(pathInfo, special);
+    case "lightning":
+      return estimateLightningSlowTime(pathInfo, special);
+    default:
+      return 0;
+  }
+}
+
+function estimateRadiusSlowTime(pathInfo, special) {
+  const decayRate = FREEZING_BUILDUP / SPECIAL_LINGER;
+  let timer = 0;
+  let total = 0;
+  iteratePathSegments(pathInfo, (cell, baseTime) => {
+    const inside = isPointInsideSpecial(centerOf(cell), special);
+    if (inside) {
+      timer = Math.min(FREEZING_BUILDUP, timer + baseTime);
+    } else if (timer > 0) {
+      timer = Math.max(0, timer - decayRate * baseTime);
+    }
+    if (timer > 0) {
+      const ratio = Math.min(1, timer / FREEZING_BUILDUP);
+      const auraMult =
+        SPECIAL_SLOW_MULT - (SPECIAL_SLOW_MULT - FREEZING_MIN_MULT) * ratio;
+      total += baseTime * (1 / auraMult - 1);
+    }
+  });
+  return total;
+}
+
+function estimateBeamSlowTime(pathInfo, special, orientation) {
+  let linger = 0;
+  let total = 0;
+  iteratePathSegments(pathInfo, (cell, baseTime) => {
+    const inside =
+      orientation === "row"
+        ? cell.y === special.cell.y
+        : cell.x === special.cell.x;
+    if (inside) {
+      linger = SPECIAL_LINGER;
+    } else if (linger > 0) {
+      linger = Math.max(0, linger - baseTime);
+    }
+    if (inside || linger > 0) {
+      total += baseTime * (1 / SPECIAL_SLOW_MULT - 1);
+    }
+  });
+  return total;
+}
+
+function estimateGravitySlowTime(pathInfo, special) {
+  let total = 0;
+  iteratePathSegments(pathInfo, (cell, baseTime) => {
+    const center = centerOf(cell);
+    const dx = special.cell.x + 0.5 - center.x;
+    const dy = special.cell.y + 0.5 - center.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist <= SPECIAL_RADIUS) {
+      const ratio = Math.max(0, Math.min(1, dist / SPECIAL_RADIUS));
+      const target =
+        GRAVITY_MIN_MULT + (GRAVITY_MAX_MULT - GRAVITY_MIN_MULT) * ratio;
+      total += baseTime * (1 / target - 1);
+    }
+  });
+  return total;
+}
+
+function estimateLightningSlowTime(pathInfo, special) {
+  let cooldown = 0;
+  let total = 0;
+  iteratePathSegments(pathInfo, (cell, baseTime) => {
+    const center = centerOf(cell);
+    const dist = Math.hypot(
+      special.cell.x + 0.5 - center.x,
+      special.cell.y + 0.5 - center.y
+    );
+    const inside = dist <= SPECIAL_RADIUS;
+    if (inside && cooldown <= 0) {
+      total += LIGHTNING_STUN;
+      cooldown = LIGHTNING_COOLDOWN;
+    }
+    cooldown = Math.max(0, cooldown - baseTime);
+  });
+  return total;
+}
+
+function iteratePathSegments(pathInfo, callback) {
+  const path = pathInfo.path;
+  if (!path?.length) return;
+  for (let i = 1; i < path.length; i++) {
+    const cell = path[i];
+    const baseTime = (pathInfo.lengths[i - 1] || 0) / NPC_SPEED;
+    callback(cell, baseTime, i);
+  }
+}
+
+function estimateDetourForcedDistance(grid, current, previous) {
+  if (!previous) return 0;
+  const stepX = Math.sign(previous.x - current.x);
+  const stepY = Math.sign(previous.y - current.y);
+  if (stepX === 0 && stepY === 0) return 0;
+  let distance = 0;
+  let x = current.x;
+  let y = current.y;
+  while (true) {
+    const nextX = x + stepX;
+    const nextY = y + stepY;
+    if (!isInsideGrid(nextX, nextY)) break;
+    if (!isWalkableCell(grid, nextX, nextY)) break;
+    distance++;
+    x = nextX;
+    y = nextY;
+  }
+  return distance;
+}
+
+function collectAiTimeComponents(grid, pathInfo, special, neutralSpecials = []) {
+  const padTime = computePadSlowTime(grid, pathInfo);
+  const coverageTime = computePadCoveragePenaltyTime(grid, pathInfo.path);
+  const specialUsage = computeSpecialUsageTimes(grid, pathInfo, special, neutralSpecials);
+  const slowTime = Math.max(0, padTime + specialUsage.owned + specialUsage.neutral);
+  return {
+    padTime,
+    specialOwnedTime: specialUsage.owned,
+    specialNeutralTime: specialUsage.neutral,
+    coverageTime,
+    slowTime
+  };
+}
+
+function estimateSpecialPadSynergyTime(grid, path, special) {
+  if (!path?.length) return 0;
+  let time = 0;
+  path.forEach((node) => {
+    if (!isInsideGrid(node.x, node.y)) return;
+    const pos = centerOf(node);
+    if (!isPointInsideSpecial(pos, special)) return;
+    const padType = padTypeFromCell(grid[node.y]?.[node.x]);
+    if (!padType) return;
+    if (padType === "slow" || padType === "stone") {
+      time += SPECIAL_PAD_SYNERGY_TIME;
+    } else if (padType === "detour" || padType === "rewind") {
+      time += SPECIAL_PAD_SYNERGY_STRONG_TIME;
+    }
+  });
+  return time;
+}
+
+function estimateSpecialOverlapTime(path, special, neutralSpecials = []) {
+  if (!path?.length || !neutralSpecials?.length) return 0;
+  let total = 0;
+  neutralSpecials.forEach((neutral) => {
+    if (!neutral?.placed || !neutral.cell) return;
+    let overlap = 0;
+    path.forEach((node) => {
+      const pos = centerOf(node);
+      if (isPointInsideSpecial(pos, special) && isPointInsideSpecial(pos, neutral)) {
+        overlap++;
+      }
+    });
+    if (overlap > 0) {
+      total += overlap * SPECIAL_NEUTRAL_OVERLAP_TIME;
+    }
+  });
+  return total;
 }
 
 function keyFor(x, y) {
