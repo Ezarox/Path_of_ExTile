@@ -2339,7 +2339,7 @@ function updateSpecialArea(runner, delta) {
     const centerX = special.cell.x + 0.5;
     const centerY = special.cell.y + 0.5;
     const dist = Math.hypot(centerX - pos.x, centerY - pos.y);
-    if (dist <= LIGHTNING_EFFECT_RADIUS && special.cooldown <= 0 && runner.effects.stunTimer <= 0) {
+    if (dist <= LIGHTNING_EFFECT_RADIUS + NPC_RADIUS && special.cooldown <= 0 && runner.effects.stunTimer <= 0) {
       runner.effects.stunTimer = LIGHTNING_STUN;
       special.cooldown = LIGHTNING_COOLDOWN;
       special.flashTimer = 0.3;
@@ -3921,7 +3921,7 @@ function estimateLightningSlowTime(pathInfo, special) {
       special.cell.x + 0.5 - center.x,
       special.cell.y + 0.5 - center.y
     );
-    const inside = dist <= LIGHTNING_EFFECT_RADIUS;
+    const inside = dist <= LIGHTNING_EFFECT_RADIUS + NPC_RADIUS;
     if (inside && cooldown <= 0) {
       total += LIGHTNING_STUN;
       cooldown = LIGHTNING_COOLDOWN;
