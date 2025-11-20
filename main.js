@@ -43,7 +43,7 @@ const FREEZING_BUILDUP = 10;
 const SPECIAL_SLOW_MULT = 0.7;
 const FREEZING_MIN_MULT = 0.3;
 const LIGHTNING_STUN = 1.5;
-const LIGHTNING_COOLDOWN = 3;
+const LIGHTNING_COOLDOWN = 3.25;
 const PANEL_SLOW_MULT = 0.55;
 const PANEL_FAST_MULT = 1.5;
 const MEDUSA_SLOW_MULT = 0.3;
@@ -80,22 +80,22 @@ const SPECIAL_PAD_SYNERGY_TIME = PANEL_EFFECT_DURATION * (1 / PANEL_SLOW_MULT - 
 const SPECIAL_PAD_SYNERGY_STRONG_TIME = SPECIAL_PAD_SYNERGY_TIME * 1.25;
 const SPECIAL_NEUTRAL_OVERLAP_TIME = SPECIAL_LINGER * (1 / SPECIAL_SLOW_MULT - 1) * 0.75;
 const BENEFICIAL_PAD_TYPES = ["slow", "detour", "stone", "rewind"];
-const PAD_UNVISITED_PENALTY_BASE = PAD_SLOW_EXTRA_TIME * 0.35;
 const AI_WEIGHT_DEFAULTS = {
-  padTime: 0.0001,
-  specialTime: 2.46,
-  neutralSpecialTime: 0.255,
-  padCoverage: 0,
-  padCoveragePenalty: PAD_UNVISITED_PENALTY_BASE * 2.681,
-  slowInteraction: 0.014
+  specialTime: 1.975,
+  neutralSpecialTime: 0.173,
+  slowInteraction: 0.027,
+  blockUsage: 0.5,
+  lightningPadPenalty: 0.4,
+  beamCrossings: 0.4
 };
 const aiWeights = { ...AI_WEIGHT_DEFAULTS };
+const LIGHTNING_EFFECT_RADIUS = 4;
 const EARLY_PATH_CELLS = 35;
 const SPEED_DIVERSION_RADIUS = 3;
 const QUICK_REVIEW_TRIGGER = 4;
-const PLACEMENT_LOOKAHEAD_COUNT = 2;
+const PLACEMENT_LOOKAHEAD_COUNT = 3;
 const LOOKAHEAD_BUDGET = 4;
-const LOOKAHEAD_INTERVAL = 4;
+const LOOKAHEAD_INTERVAL = 1;
 const LOOKAHEAD_TRIGGER_THRESHOLD = 0.02;
 const PLACEMENT_LOOKAHEAD_WEIGHT = 0.2;
 const CARDINAL_NEIGHBORS = [
@@ -330,7 +330,10 @@ const state = {
   playerSingles: [],
   playerGrid: createEmptyGrid(),
   baseGrid: null,
+  baseStaticCount: 0,
   aiGrid: null,
+  aiWalls: [],
+  aiSingles: [],
   hoverCell: null,
   floatingTexts: [],
   buildMode: "normal",
@@ -427,10 +430,13 @@ function startGame(seedText) {
 
   const baseGeneration = generateBaseGrid(state.rng);
   state.baseGrid = baseGeneration.grid;
+  state.baseStaticCount = countCells(state.baseGrid, CELL_STATIC);
   state.baseNeutralSpecials = baseGeneration.neutralSpecial ? [baseGeneration.neutralSpecial] : [];
   state.neutralSpecials = state.baseNeutralSpecials.map(cloneSpecial);
   state.playerGrid = cloneGrid(state.baseGrid);
   state.aiGrid = null;
+  state.aiWalls = [];
+  state.aiSingles = [];
   state.coins = randomInt(state.rng, 10, 21);
   state.coinBudget = state.coins;
   const singleCount = state.rng() < 0.1 ? 2 : 1;
@@ -818,6 +824,8 @@ function buildAiLayout() {
   let wallsLeft = state.coinBudget;
   let singlesLeft = state.singleBudget || 0;
   let currentScore = evaluateGridForAi(grid, special, neutralSpecials);
+  state.aiWalls = [];
+  state.aiSingles = [];
   const lookaheadState = {
     remaining: LOOKAHEAD_BUDGET,
     interval: LOOKAHEAD_INTERVAL,
@@ -841,19 +849,18 @@ function buildAiLayout() {
       placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
       ensureOpenings(grid);
       wallsLeft--;
+      state.aiWalls.push({ x: placement.x, y: placement.y });
     } else if (placement.type === "single" && singlesLeft > 0) {
       grid[placement.y][placement.x] = CELL_SINGLE;
       ensureOpenings(grid);
+      state.aiSingles.push({ x: placement.x, y: placement.y });
       singlesLeft--;
     } else {
       break;
     }
     currentScore = placement.score;
-    if (wallsLeft + singlesLeft <= QUICK_REVIEW_TRIGGER) {
-      currentScore = quickPlacementReview(grid, special, neutralSpecials, currentScore);
-    }
   }
-  currentScore = refineAiLayout(grid, special, neutralSpecials, currentScore);
+  currentScore = reduceMandatorySpeedPads(grid, special, neutralSpecials, currentScore);
   placeAiSpecial(grid, special, neutralSpecials, specialHotspots);
   return { grid, special };
 }
@@ -873,8 +880,6 @@ function findBestAiPlacement(
   }
   const lookaheadEnabled =
     lookaheadState?.remaining > 0 &&
-    (lookaheadState.interval || 1) > 0 &&
-    lookaheadState.index % (lookaheadState.interval || 1) === 0 &&
     lookaheadState.remaining <= PLACEMENT_LOOKAHEAD_COUNT;
   const candidateLimit = lookaheadEnabled ? PLACEMENT_LOOKAHEAD_COUNT : 1;
   const candidates = [];
@@ -991,10 +996,11 @@ function findTopAiSingleCandidates(
   for (const entry of singleCandidates) {
     const [cx, cy] = entry.split(",").map(Number);
     if (!canPlaceSingle(grid, cx, cy)) continue;
+    const previous = grid[cy][cx];
     grid[cy][cx] = CELL_SINGLE;
     ensureOpenings(grid);
     const score = evaluateGridForAi(grid, special, neutralSpecials);
-    grid[cy][cx] = CELL_EMPTY;
+    grid[cy][cx] = previous;
     ensureOpenings(grid);
     if (!Number.isFinite(score)) continue;
     insertCandidate(results, { type: "single", x: cx, y: cy, score }, limit);
@@ -1056,6 +1062,7 @@ function applyPlacementCandidate(grid, candidate) {
   if (candidate.type === "wall") {
     placeBlock(grid, candidate.x, candidate.y, CELL_PLAYER);
   } else {
+    candidate.previous = grid[candidate.y][candidate.x];
     grid[candidate.y][candidate.x] = CELL_SINGLE;
   }
   ensureOpenings(grid);
@@ -1065,7 +1072,9 @@ function revertPlacementCandidate(grid, candidate) {
   if (candidate.type === "wall") {
     clearBlock(grid, candidate.x, candidate.y);
   } else {
-    grid[candidate.y][candidate.x] = CELL_EMPTY;
+    const prev = candidate.previous != null ? candidate.previous : CELL_EMPTY;
+    grid[candidate.y][candidate.x] = prev;
+    candidate.previous = null;
   }
   ensureOpenings(grid);
 }
@@ -1092,9 +1101,23 @@ function runStructureRefinement(grid, special, neutralSpecials, currentScore) {
   for (let i = 0; i < iterations; i++) {
     const pathInfo = analyzePath(grid);
     const earlySet = buildEarlyPathSet(pathInfo?.path);
-    const wallResult = tryRepositionAiWall(grid, special, neutralSpecials, score, earlySet);
+    const wallResult = tryRepositionAiWall(
+      grid,
+      special,
+      neutralSpecials,
+      score,
+      earlySet,
+      state.aiWalls
+    );
     if (wallResult.changed) score = wallResult.score;
-    const singleResult = tryRepositionAiSingle(grid, special, neutralSpecials, score, earlySet);
+    const singleResult = tryRepositionAiSingle(
+      grid,
+      special,
+      neutralSpecials,
+      score,
+      earlySet,
+      state.aiSingles
+    );
     if (singleResult.changed) score = singleResult.score;
   }
   return score;
@@ -1109,7 +1132,8 @@ function quickPlacementReview(grid, special, neutralSpecials, currentScore) {
     special,
     neutralSpecials,
     currentScore,
-    earlySet
+    earlySet,
+    state.aiWalls
   );
   let score = wallResult.changed ? wallResult.score : currentScore;
   const singleResult = tryRepositionAiSingle(
@@ -1117,7 +1141,8 @@ function quickPlacementReview(grid, special, neutralSpecials, currentScore) {
     special,
     neutralSpecials,
     score,
-    earlySet
+    earlySet,
+    state.aiSingles
   );
   if (singleResult.changed) score = singleResult.score;
   return score;
@@ -1831,30 +1856,30 @@ function resetAiWeights() {
 function sweepAiWeights(seed, samples = 50, options = {}) {
   const runs = options.runs != null ? Math.max(1, options.runs | 0) : 1;
   const ranges = {
-    padTime: 0.5,
-    specialTime: 0.5,
-    neutralSpecialTime: 0.5,
-    padCoverage: 0.5,
-    padCoveragePenalty: 0.5,
-    slowInteraction: 0.5,
+    specialTime: 1.5,
+    neutralSpecialTime: 1.5,
+    slowInteraction: 1.5,
+    blockUsage: 1.5,
+    lightningPadPenalty: 1.5,
+    beamCrossings: 1.5,
     ...options.ranges
   };
   const snapshot = { ...aiWeights };
   const report = [];
   for (let i = 0; i < samples; i++) {
     const overrides = {
-      padTime: sampleWeight(AI_WEIGHT_DEFAULTS.padTime, ranges.padTime),
       specialTime: sampleWeight(AI_WEIGHT_DEFAULTS.specialTime, ranges.specialTime),
       neutralSpecialTime: sampleWeight(
         AI_WEIGHT_DEFAULTS.neutralSpecialTime,
         ranges.neutralSpecialTime
       ),
-      padCoverage: sampleWeight(AI_WEIGHT_DEFAULTS.padCoverage, ranges.padCoverage),
-      padCoveragePenalty: sampleWeight(
-        AI_WEIGHT_DEFAULTS.padCoveragePenalty,
-        ranges.padCoveragePenalty
+      slowInteraction: sampleWeight(AI_WEIGHT_DEFAULTS.slowInteraction, ranges.slowInteraction),
+      blockUsage: sampleWeight(AI_WEIGHT_DEFAULTS.blockUsage, ranges.blockUsage),
+      lightningPadPenalty: sampleWeight(
+        AI_WEIGHT_DEFAULTS.lightningPadPenalty,
+        ranges.lightningPadPenalty
       ),
-      slowInteraction: sampleWeight(AI_WEIGHT_DEFAULTS.slowInteraction, ranges.slowInteraction)
+      beamCrossings: sampleWeight(AI_WEIGHT_DEFAULTS.beamCrossings, ranges.beamCrossings)
     };
     setAiWeights(overrides);
     const results = evaluateAiSeed(seed, runs, true);
@@ -1868,12 +1893,12 @@ function sweepAiWeights(seed, samples = 50, options = {}) {
     const bestSimulated = Math.max(...results.map((entry) => entry.simulatedTime || 0));
     report.push({
       sample: i + 1,
-      padTime: Number(aiWeights.padTime.toFixed(3)),
       specialTime: Number(aiWeights.specialTime.toFixed(3)),
       neutralSpecialTime: Number(aiWeights.neutralSpecialTime.toFixed(3)),
-      padCoverage: Number(aiWeights.padCoverage.toFixed(3)),
-      padCoveragePenalty: Number(aiWeights.padCoveragePenalty.toFixed(3)),
       slowInteraction: Number(aiWeights.slowInteraction.toFixed(3)),
+      blockUsage: Number(aiWeights.blockUsage.toFixed(3)),
+      lightningPadPenalty: Number(aiWeights.lightningPadPenalty.toFixed(3)),
+      beamCrossings: Number(aiWeights.beamCrossings.toFixed(3)),
       predictedAvg: Number(predictedAvg.toFixed(2)),
       simulatedAvg: Number(simulatedAvg.toFixed(2)),
       slowAvg: Number(slowAvg.toFixed(2)),
@@ -1915,6 +1940,10 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
   const mandatorySpeeds = countMandatorySpeedPads(layout.grid, pathInfo.path);
   const components = collectAiTimeComponents(layout.grid, pathInfo, layout.special, state.baseNeutralSpecials);
   const simulated = simulateRunnerTime(layout.grid, layout.special, state.baseNeutralSpecials);
+  const blockUsage = computeBlockUsageScore(layout.grid, pathInfo.path);
+  const specialInfo = layout.special?.cell
+    ? `${layout.special.type}@(${layout.special.cell.x + 1},${layout.special.cell.y + 1})`
+    : "none";
   return {
     seed,
     distance: Number(pathInfo.totalDistance.toFixed(2)),
@@ -1923,7 +1952,8 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
     mandatorySpeeds,
     padHits,
     slowTime: Number(components.slowTime.toFixed(2)),
-    special: layout.special?.cell ? `${layout.special.type}@(${layout.special.cell.x},${layout.special.cell.y})` : "none"
+    blockUsage: Number(blockUsage.toFixed(3)),
+    special: specialInfo
   };
 }
 
@@ -2309,7 +2339,7 @@ function updateSpecialArea(runner, delta) {
     const centerX = special.cell.x + 0.5;
     const centerY = special.cell.y + 0.5;
     const dist = Math.hypot(centerX - pos.x, centerY - pos.y);
-    if (dist <= SPECIAL_RADIUS && special.cooldown <= 0 && runner.effects.stunTimer <= 0) {
+    if (dist <= LIGHTNING_EFFECT_RADIUS && special.cooldown <= 0 && runner.effects.stunTimer <= 0) {
       runner.effects.stunTimer = LIGHTNING_STUN;
       special.cooldown = LIGHTNING_COOLDOWN;
       special.flashTimer = 0.3;
@@ -2617,7 +2647,7 @@ function drawSpecialOverlay(special) {
     ctx.clip();
     const centerX = (special.cell.x + 0.5) * CELL_SIZE;
     const centerY = GRID_OFFSET_Y + (special.cell.y + 0.5) * CELL_SIZE;
-    const radius = SPECIAL_RADIUS * CELL_SIZE;
+    const radius = (SPECIAL_RADIUS + 0.5) * CELL_SIZE;
     const innerRadius = radius - 6;
     const outerRingGrad = ctx.createRadialGradient(centerX, centerY, innerRadius, centerX, centerY, radius);
     outerRingGrad.addColorStop(0, "rgba(255,255,255,0.015)");
@@ -2668,7 +2698,7 @@ function drawSpecialOverlay(special) {
     const centerX = (special.cell.x + 0.5) * CELL_SIZE;
     const centerY = GRID_OFFSET_Y + (special.cell.y + 0.5) * CELL_SIZE;
     const ratio = 1 - Math.min(1, (special.cooldown || 0) / LIGHTNING_COOLDOWN);
-    const radius = SPECIAL_RADIUS * CELL_SIZE;
+    const radius = LIGHTNING_EFFECT_RADIUS * CELL_SIZE;
     const ready = (special.cooldown || 0) <= 0;
     const colorReady = "rgba(255,215,130,0.15)";
     const colorInactive = "rgba(140,140,160,0.05)";
@@ -3497,10 +3527,24 @@ function countBlocks(grid, type) {
   return Math.floor(total / 4);
 }
 
+function countCells(grid, value) {
+  if (!grid) return 0;
+  let total = 0;
+  for (let y = 0; y < GRID_SIZE; y++) {
+    for (let x = 0; x < GRID_SIZE; x++) {
+      if (grid[y][x] === value) total++;
+    }
+  }
+  return total;
+}
+
 function isCellAvailableForSpecial(grid, gx, gy) {
   if (gx < 0 || gy < 0 || gx >= GRID_SIZE || gy >= GRID_SIZE) return false;
   if ((gy === 0 || gy === GRID_SIZE - 1) && gx === ENTRANCE_X) return false;
-  return ![CELL_STATIC, CELL_PLAYER, CELL_SPECIAL, CELL_SINGLE].includes(grid[gy][gx]);
+  const value = grid[gy][gx];
+  if ([CELL_STATIC, CELL_PLAYER, CELL_SPECIAL, CELL_SINGLE].includes(value)) return false;
+  if (isPadCell(value)) return false;
+  return true;
 }
 
 // PATHFINDING ---------------------------------------------------------------
@@ -3634,23 +3678,26 @@ function evaluateGridForAi(grid, special = null, neutralSpecials = [], pathInfoO
   const info = pathInfoOverride || analyzePath(grid);
   if (!info) return -Infinity;
   const components = collectAiTimeComponents(grid, info, special, neutralSpecials);
-  const padContribution = components.padTime * aiWeights.padTime * PAD_TIME_TO_DISTANCE;
   const ownedSpecialContribution =
     components.specialOwnedTime * aiWeights.specialTime * PAD_TIME_TO_DISTANCE +
     components.specialOwnedTime * SPECIAL_PLACEMENT_BONUS;
   const neutralSpecialContribution =
     components.specialNeutralTime * aiWeights.neutralSpecialTime * PAD_TIME_TO_DISTANCE;
-  const coverageContribution =
-    components.coverageTime * aiWeights.padCoverage * PAD_TIME_TO_DISTANCE;
   const interactionContribution = aiWeights.slowInteraction * components.slowTime * info.totalDistance;
+  const blockUsageContribution =
+    computeBlockUsageScore(grid, info.path) * aiWeights.blockUsage;
+  const lightningPenalty = computeLightningPadPenalty(grid, info, special) * aiWeights.lightningPadPenalty;
+  const beamCrossContribution = computeBeamCrossings(info.path, special) * aiWeights.beamCrossings;
   return (
     info.totalDistance * AI_PATH_WEIGHT +
     info.padScore +
-    padContribution +
+
     ownedSpecialContribution +
     neutralSpecialContribution +
-    coverageContribution +
-    interactionContribution
+    interactionContribution +
+    blockUsageContribution +
+    beamCrossContribution -
+    lightningPenalty
   );
 }
 
@@ -3717,86 +3764,60 @@ function countMandatorySpeedPads(grid, path) {
   return count;
 }
 
-function computePadSlowTime(grid, pathInfo) {
-  const path = pathInfo.path;
-  const lengths = pathInfo.lengths;
-  if (!path?.length) return 0;
-  let totalTime = 0;
-  let traveled = 0;
-  for (let i = 1; i < path.length; i++) {
-    traveled += lengths[i - 1] || 0;
-    const node = path[i];
-    const prev = path[i - 1];
-    if (node.x < 0 || node.y < 0 || node.x >= GRID_SIZE || node.y >= GRID_SIZE) continue;
-    const value = grid[node.y]?.[node.x];
-    const padType = padTypeFromCell(value);
-    if (!padType) continue;
-    let penaltyTime = 0;
-    switch (padType) {
-      case "slow":
-        penaltyTime = PAD_SLOW_EXTRA_TIME;
-        break;
-      case "stone":
-        penaltyTime = PAD_STONE_EXTRA_TIME;
-        break;
-      case "speed":
-        if (padIsMandatory(grid, node.x, node.y)) {
-          penaltyTime = -PAD_SPEED_TIME_DELTA;
-        }
-        break;
-      case "detour": {
-        const forced = estimateDetourForcedDistance(grid, node, prev);
-        penaltyTime = forced / NPC_SPEED;
-        break;
-      }
-      case "rewind":
-        penaltyTime = traveled / NPC_SPEED;
-        break;
-      default:
-        penaltyTime = 0;
-        break;
-    }
-    totalTime += penaltyTime;
-  }
-  return totalTime;
-}
-
-function computePadCoveragePenaltyTime(grid, path) {
-  if (!path?.length) return 0;
-  const visited = new Set();
+function computeBlockUsageScore(grid, path) {
+  if (!path?.length || !state.baseGrid) return 0;
+  const totalStatic = state.baseStaticCount || 0;
+  if (!totalStatic) return 0;
+  let used = 0;
+  const seen = new Set();
   path.forEach((node) => {
     if (!isInsideGrid(node.x, node.y)) return;
-    const padType = padTypeFromCell(grid[node.y]?.[node.x]);
-    if (padType && BENEFICIAL_PAD_TYPES.includes(padType)) {
-      visited.add(keyFor(node.x, node.y));
+    const key = keyFor(node.x, node.y);
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (state.baseGrid[node.y]?.[node.x] === CELL_STATIC) {
+      used++;
     }
   });
+  return used / Math.max(1, totalStatic);
+}
+
+function computeLightningPadPenalty(grid, pathInfo, special) {
+  if (!special?.placed || special.type !== "lightning") return 0;
   let penalty = 0;
-  for (let y = 0; y < GRID_SIZE; y++) {
-    for (let x = 0; x < GRID_SIZE; x++) {
-      const padType = padTypeFromCell(grid[y][x]);
-      if (!padType || !BENEFICIAL_PAD_TYPES.includes(padType)) continue;
-      const cellKey = keyFor(x, y);
-      if (visited.has(cellKey)) continue;
-      const dist = distanceToPath(path, x, y);
-      if (dist == null) continue;
-      const weight = dist > 12 ? 0 : Math.max(0, 1 - dist / 12);
-      penalty += weight * PAD_UNVISITED_PENALTY_BASE;
+  iteratePathSegments(pathInfo, (cell, baseTime) => {
+    if (!isInsideGrid(cell.x, cell.y)) return;
+    const padType = padTypeFromCell(grid[cell.y]?.[cell.x]);
+    if (padType !== "slow") return;
+    const center = centerOf(cell);
+    const dist = Math.hypot(
+      special.cell.x + 0.5 - center.x,
+      special.cell.y + 0.5 - center.y
+    );
+    if (dist <= SPECIAL_RADIUS) {
+      penalty += baseTime;
     }
-  }
-  return -penalty;
+  });
+  return penalty;
 }
 
-function distanceToPath(path, px, py) {
-  let best = null;
+function computeBeamCrossings(path, special) {
+  if (!special?.placed) return 0;
+  if (special.type !== "row" && special.type !== "column") return 0;
+  let crossings = 0;
+  let inside = false;
   path.forEach((node) => {
     if (!isInsideGrid(node.x, node.y)) return;
-    const dx = node.x - px;
-    const dy = node.y - py;
-    const dist = Math.abs(dx) + Math.abs(dy);
-    if (best == null || dist < best) best = dist;
+    const posInside =
+      special.type === "row"
+        ? node.y === special.cell.y
+        : node.x === special.cell.x;
+    if (posInside && !inside) {
+      crossings++;
+    }
+    inside = posInside;
   });
-  return best;
+  return crossings;
 }
 
 function computeSpecialUsageTimes(grid, pathInfo, special, neutralSpecials = []) {
@@ -3900,7 +3921,7 @@ function estimateLightningSlowTime(pathInfo, special) {
       special.cell.x + 0.5 - center.x,
       special.cell.y + 0.5 - center.y
     );
-    const inside = dist <= SPECIAL_RADIUS;
+    const inside = dist <= LIGHTNING_EFFECT_RADIUS;
     if (inside && cooldown <= 0) {
       total += LIGHTNING_STUN;
       cooldown = LIGHTNING_COOLDOWN;
@@ -3941,15 +3962,11 @@ function estimateDetourForcedDistance(grid, current, previous) {
 }
 
 function collectAiTimeComponents(grid, pathInfo, special, neutralSpecials = []) {
-  const padTime = computePadSlowTime(grid, pathInfo);
-  const coverageTime = computePadCoveragePenaltyTime(grid, pathInfo.path);
   const specialUsage = computeSpecialUsageTimes(grid, pathInfo, special, neutralSpecials);
-  const slowTime = Math.max(0, padTime + specialUsage.owned + specialUsage.neutral);
+  const slowTime = Math.max(0, specialUsage.owned + specialUsage.neutral);
   return {
-    padTime,
     specialOwnedTime: specialUsage.owned,
     specialNeutralTime: specialUsage.neutral,
-    coverageTime,
     slowTime
   };
 }
