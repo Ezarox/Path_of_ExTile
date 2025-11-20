@@ -81,11 +81,14 @@ const SPECIAL_PAD_SYNERGY_STRONG_TIME = SPECIAL_PAD_SYNERGY_TIME * 1.25;
 const SPECIAL_NEUTRAL_OVERLAP_TIME = SPECIAL_LINGER * (1 / SPECIAL_SLOW_MULT - 1) * 0.75;
 const BENEFICIAL_PAD_TYPES = ["slow", "detour", "stone", "rewind"];
 const AI_WEIGHT_DEFAULTS = {
-  specialTime: 1.975,
-  neutralSpecialTime: 0.173,
-  slowInteraction: 0.027,
-  blockUsage: 0.5,
-  lightningPadPenalty: 0.4,
+  pathTime: 1.4,
+  specialTime: 2,
+  neutralSpecialTime: 0.5,
+  slowTime: 1,
+  slowStack: 0.6,
+  slowInteraction: 0.046,
+  blockUsage: 2.5,
+  lightningPadPenalty: 1.5,
   beamCrossings: 0.4
 };
 const aiWeights = { ...AI_WEIGHT_DEFAULTS };
@@ -98,6 +101,7 @@ const LOOKAHEAD_BUDGET = 4;
 const LOOKAHEAD_INTERVAL = 1;
 const LOOKAHEAD_TRIGGER_THRESHOLD = 0.02;
 const PLACEMENT_LOOKAHEAD_WEIGHT = 0.2;
+let aiLookaheadBudgetOverride = null;
 const CARDINAL_NEIGHBORS = [
   [1, 0],
   [-1, 0],
@@ -777,6 +781,7 @@ function startRace(forceStart = false) {
     const aiLayout = buildAiLayout();
     state.aiGrid = aiLayout.grid;
     state.aiSpecial = aiLayout.special;
+    state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
   }
 
   const playerRunner = createRunner("You", playerGrid, playerSpecial, state.baseNeutralSpecials);
@@ -816,6 +821,12 @@ function startRace(forceStart = false) {
   updatePhaseLabel("Phase: Race");
 }
 
+function currentLookaheadBudget() {
+  return aiLookaheadBudgetOverride != null
+    ? Math.max(0, aiLookaheadBudgetOverride | 0)
+    : LOOKAHEAD_BUDGET;
+}
+
 function buildAiLayout() {
   const grid = cloneGrid(state.baseGrid);
   const special = createSpecialTemplate(state.specialTemplate.type);
@@ -827,9 +838,10 @@ function buildAiLayout() {
   state.aiWalls = [];
   state.aiSingles = [];
   const lookaheadState = {
-    remaining: LOOKAHEAD_BUDGET,
+    remaining: currentLookaheadBudget(),
     interval: LOOKAHEAD_INTERVAL,
-    index: 0
+    index: 0,
+    used: 0
   };
   const maxIterations = Math.max(1, wallsLeft + singlesLeft);
   for (let i = 0; i < maxIterations; i++) {
@@ -862,7 +874,7 @@ function buildAiLayout() {
   }
   currentScore = reduceMandatorySpeedPads(grid, special, neutralSpecials, currentScore);
   placeAiSpecial(grid, special, neutralSpecials, specialHotspots);
-  return { grid, special };
+  return { grid, special, lookaheadUsed: lookaheadState.used || 0 };
 }
 
 function findBestAiPlacement(
@@ -878,9 +890,7 @@ function findBestAiPlacement(
   if (lookaheadState) {
     lookaheadState.index = (lookaheadState.index || 0) + 1;
   }
-  const lookaheadEnabled =
-    lookaheadState?.remaining > 0 &&
-    lookaheadState.remaining <= PLACEMENT_LOOKAHEAD_COUNT;
+  const lookaheadEnabled = lookaheadState?.remaining > 0;
   const candidateLimit = lookaheadEnabled ? PLACEMENT_LOOKAHEAD_COUNT : 1;
   const candidates = [];
   if (allowWalls) {
@@ -911,6 +921,9 @@ function findBestAiPlacement(
     return topCandidate;
   }
   lookaheadState.remaining--;
+  if (lookaheadState) {
+    lookaheadState.used = (lookaheadState.used || 0) + 1;
+  }
   const top = candidates.slice(0, PLACEMENT_LOOKAHEAD_COUNT);
   let best = null;
   top.forEach((candidate) => {
@@ -1773,8 +1786,24 @@ function advanceRunnerSimulation(runner, delta) {
   }
 }
 
-function evaluateAiSeed(seed, runs = 1, silent = false) {
+function evaluateAiSeed(seed, runs = 1, silentOrOptions = false, additionalOptions = {}) {
+  let config = {};
+  if (typeof silentOrOptions === "boolean" || silentOrOptions == null) {
+    config = { ...(additionalOptions || {}) };
+    if (silentOrOptions) config.silent = true;
+  } else if (typeof silentOrOptions === "object") {
+    config = { ...silentOrOptions };
+  } else {
+    config = { ...(additionalOptions || {}) };
+  }
+  const silent = !!config.silent;
+  const lookaheadOverride =
+    config.lookaheadBudget != null ? Number(config.lookaheadBudget) : null;
   const snapshot = snapshotAiContext();
+  const previousLookaheadOverride = aiLookaheadBudgetOverride;
+  if (Number.isFinite(lookaheadOverride)) {
+    aiLookaheadBudgetOverride = Math.max(0, Math.floor(lookaheadOverride));
+  }
   const iterations = Math.max(1, runs | 0);
   const results = [];
   for (let i = 0; i < iterations; i++) {
@@ -1801,6 +1830,7 @@ function evaluateAiSeed(seed, runs = 1, silent = false) {
     results.push(metrics);
   }
   restoreAiContext(snapshot);
+  aiLookaheadBudgetOverride = previousLookaheadOverride;
   if (!silent && typeof console !== "undefined" && console.table) {
     console.table(results);
   }
@@ -1855,32 +1885,37 @@ function resetAiWeights() {
 
 function sweepAiWeights(seed, samples = 50, options = {}) {
   const runs = options.runs != null ? Math.max(1, options.runs | 0) : 1;
+  const weightKeys = Object.keys(AI_WEIGHT_DEFAULTS);
   const ranges = {
+    pathTime: 1.5,
     specialTime: 1.5,
     neutralSpecialTime: 1.5,
+    slowTime: 1.5,
+    slowStack: 1.5,
     slowInteraction: 1.5,
     blockUsage: 1.5,
     lightningPadPenalty: 1.5,
     beamCrossings: 1.5,
     ...options.ranges
   };
+  let varySet = null;
+  if (options.varyOnly) {
+    const list = Array.isArray(options.varyOnly) ? options.varyOnly : [options.varyOnly];
+    varySet = new Set(list.filter((key) => weightKeys.includes(key)));
+    if (!varySet.size) varySet = null;
+  }
   const snapshot = { ...aiWeights };
   const report = [];
   for (let i = 0; i < samples; i++) {
-    const overrides = {
-      specialTime: sampleWeight(AI_WEIGHT_DEFAULTS.specialTime, ranges.specialTime),
-      neutralSpecialTime: sampleWeight(
-        AI_WEIGHT_DEFAULTS.neutralSpecialTime,
-        ranges.neutralSpecialTime
-      ),
-      slowInteraction: sampleWeight(AI_WEIGHT_DEFAULTS.slowInteraction, ranges.slowInteraction),
-      blockUsage: sampleWeight(AI_WEIGHT_DEFAULTS.blockUsage, ranges.blockUsage),
-      lightningPadPenalty: sampleWeight(
-        AI_WEIGHT_DEFAULTS.lightningPadPenalty,
-        ranges.lightningPadPenalty
-      ),
-      beamCrossings: sampleWeight(AI_WEIGHT_DEFAULTS.beamCrossings, ranges.beamCrossings)
-    };
+    const overrides = {};
+    weightKeys.forEach((key) => {
+      if (varySet && !varySet.has(key)) {
+        overrides[key] = Number(AI_WEIGHT_DEFAULTS[key]);
+      } else {
+        const range = ranges[key] != null ? ranges[key] : 1.5;
+        overrides[key] = sampleWeight(AI_WEIGHT_DEFAULTS[key], range);
+      }
+    });
     setAiWeights(overrides);
     const results = evaluateAiSeed(seed, runs, true);
     if (!results.length) continue;
@@ -1893,8 +1928,11 @@ function sweepAiWeights(seed, samples = 50, options = {}) {
     const bestSimulated = Math.max(...results.map((entry) => entry.simulatedTime || 0));
     report.push({
       sample: i + 1,
+      pathTime: Number(aiWeights.pathTime.toFixed(3)),
       specialTime: Number(aiWeights.specialTime.toFixed(3)),
       neutralSpecialTime: Number(aiWeights.neutralSpecialTime.toFixed(3)),
+      slowTime: Number(aiWeights.slowTime.toFixed(3)),
+      slowStack: Number(aiWeights.slowStack.toFixed(3)),
       slowInteraction: Number(aiWeights.slowInteraction.toFixed(3)),
       blockUsage: Number(aiWeights.blockUsage.toFixed(3)),
       lightningPadPenalty: Number(aiWeights.lightningPadPenalty.toFixed(3)),
@@ -1927,7 +1965,9 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
       simulatedTime: null,
       padHits: {},
       mandatorySpeeds: 0,
-      slowTime: 0
+      slowTime: 0,
+      slowStack: 0,
+      lookaheadUsed: layout?.lookaheadUsed || 0
     };
   }
   const padHits = {};
@@ -1952,8 +1992,10 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
     mandatorySpeeds,
     padHits,
     slowTime: Number(components.slowTime.toFixed(2)),
+    slowStack: Number(components.slowStackTime.toFixed(2)),
     blockUsage: Number(blockUsage.toFixed(3)),
-    special: specialInfo
+    special: specialInfo,
+    lookaheadUsed: layout.lookaheadUsed || 0
   };
 }
 
@@ -3678,6 +3720,9 @@ function evaluateGridForAi(grid, special = null, neutralSpecials = [], pathInfoO
   const info = pathInfoOverride || analyzePath(grid);
   if (!info) return -Infinity;
   const components = collectAiTimeComponents(grid, info, special, neutralSpecials);
+  const pathContribution = (info.totalDistance / NPC_SPEED) * aiWeights.pathTime;
+  const slowContribution = components.slowTime * aiWeights.slowTime;
+  const slowStackContribution = components.slowStackTime * aiWeights.slowStack;
   const ownedSpecialContribution =
     components.specialOwnedTime * aiWeights.specialTime * PAD_TIME_TO_DISTANCE +
     components.specialOwnedTime * SPECIAL_PLACEMENT_BONUS;
@@ -3691,7 +3736,9 @@ function evaluateGridForAi(grid, special = null, neutralSpecials = [], pathInfoO
   return (
     info.totalDistance * AI_PATH_WEIGHT +
     info.padScore +
-
+    pathContribution +
+    slowContribution +
+    slowStackContribution +
     ownedSpecialContribution +
     neutralSpecialContribution +
     interactionContribution +
@@ -3961,13 +4008,50 @@ function estimateDetourForcedDistance(grid, current, previous) {
   return distance;
 }
 
+function computePadSlowTime(grid, pathInfo) {
+  if (!pathInfo?.path?.length) return 0;
+  let total = 0;
+  const visited = new Set();
+  let distanceSoFar = 0;
+  for (let i = 0; i < pathInfo.path.length; i++) {
+    if (i > 0) {
+      distanceSoFar += pathInfo.lengths[i - 1] || 0;
+    }
+    const cell = pathInfo.path[i];
+    if (!isInsideGrid(cell.x, cell.y)) continue;
+    const padType = padTypeFromCell(grid[cell.y]?.[cell.x]);
+    if (!padType) continue;
+    const key = keyFor(cell.x, cell.y);
+    if (visited.has(key)) continue;
+    visited.add(key);
+    if (padType === "slow") {
+      total += PAD_SLOW_EXTRA_TIME;
+    } else if (padType === "stone") {
+      total += PAD_STONE_EXTRA_TIME;
+    } else if (padType === "detour") {
+      const forced = estimateDetourForcedDistance(grid, cell, pathInfo.path[i - 1]);
+      if (forced > 0) {
+        total += forced / NPC_SPEED;
+      }
+    } else if (padType === "rewind") {
+      total += distanceSoFar / NPC_SPEED;
+    } else if (padType === "speed") {
+      total -= PAD_SPEED_TIME_DELTA;
+    }
+  }
+  return total;
+}
+
 function collectAiTimeComponents(grid, pathInfo, special, neutralSpecials = []) {
   const specialUsage = computeSpecialUsageTimes(grid, pathInfo, special, neutralSpecials);
-  const slowTime = Math.max(0, specialUsage.owned + specialUsage.neutral);
+  const padSlow = computePadSlowTime(grid, pathInfo);
+  const slowTime = Math.max(0, padSlow + specialUsage.owned + specialUsage.neutral);
+  const slowStackTime = computeSlowStackTime(grid, pathInfo, special, neutralSpecials);
   return {
+    slowTime,
+    slowStackTime,
     specialOwnedTime: specialUsage.owned,
-    specialNeutralTime: specialUsage.neutral,
-    slowTime
+    specialNeutralTime: specialUsage.neutral
   };
 }
 
@@ -4610,4 +4694,24 @@ function decayGravityOffset(offset, delta) {
     return null;
   }
   return next;
+}
+function computeSlowStackTime(grid, pathInfo, special, neutralSpecials = []) {
+  if (!pathInfo?.path?.length) return 0;
+  let total = 0;
+  iteratePathSegments(pathInfo, (cell, baseTime) => {
+    if (!isInsideGrid(cell.x, cell.y)) return;
+    const slows = [];
+    const padType = padTypeFromCell(grid[cell.y]?.[cell.x]);
+    if (padType === "slow" || padType === "stone") slows.push(1);
+    const pos = centerOf(cell);
+    if (special?.placed && isPointInsideSpecial(pos, special)) slows.push(1);
+    neutralSpecials?.forEach((ns) => {
+      if (!ns?.placed) return;
+      if (isPointInsideSpecial(pos, ns)) slows.push(1);
+    });
+    if (slows.length >= 2) {
+      total += baseTime * (slows.length - 1);
+    }
+  });
+  return total;
 }
