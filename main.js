@@ -1414,7 +1414,7 @@ const VS_WS_URL =
       ? "wss://pathofextile-production.up.railway.app"
       : "ws://localhost:8080"
     : "";
-const VS_BUILD_SECONDS = 90;
+const VS_BUILD_SECONDS = 86;
 
 async function buildAiLayoutAsync() {
   const t0 = performance.now();
@@ -5008,14 +5008,8 @@ function placePowerPanels(grid, rng) {
 
 function placeNeutralSpecial(grid, rng) {
   const roll = rng();
-  // 20% none, 20% lightning, 20% radius, 20% gravity, 10% column, 10% row
-  if (roll < 0.2) return null;
-  let type = "lightning";
-  if (roll < 0.4) type = "lightning";
-  else if (roll < 0.6) type = "radius";
-  else if (roll < 0.8) type = "gravity";
-  else if (roll < 0.9) type = "column";
-  else type = "row";
+  if (roll < 0.25) return null;
+  const type = roll < 0.5 ? "lightning" : roll < 0.75 ? "row" : "column";
   const cells = [];
   for (let y = 1; y < GRID_SIZE - 1; y++) {
     for (let x = 0; x < GRID_SIZE; x++) {
@@ -6289,8 +6283,8 @@ function cloneNeutralSpecials(list) {
 
 function pickSpecialType(rng) {
   const roll = rng();
-  if (roll < 0.25) return "lightning";
-  if (roll < 0.50) return "radius";
+  if (roll < 0.25) return "radius";
+  if (roll < 0.5) return "lightning";
   if (roll < 0.75) return "gravity";
   if (roll < 0.875) return "row";
   return "column";
