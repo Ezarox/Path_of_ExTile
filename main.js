@@ -66,6 +66,7 @@ const PAD_SLOW_EXTRA_TIME = PANEL_EFFECT_DURATION * (1 / PANEL_SLOW_MULT - 1);
 const PAD_SPEED_TIME_DELTA = PANEL_EFFECT_DURATION * (1 - 1 / PANEL_FAST_MULT);
 const PAD_STONE_EXTRA_TIME = 2 * (1 / MEDUSA_SLOW_MULT - 1);
 const PAD_TIME_TO_DISTANCE = NPC_SPEED;
+const PREDICT_SLOW_SCALE = 0.82;
 const SPECIAL_PLACEMENT_BONUS = 1.8;
 const SPECIAL_HOTSPOT_LIMIT = 5;
 const SPECIAL_HOTSPOT_TOLERANCE = 35;
@@ -73,6 +74,7 @@ const SPECIAL_PATH_GAIN_THRESHOLD = 10;
 const SPECIAL_RADIUS_TIME_PER_TILE =
   (FREEZING_BUILDUP / 2) * (1 / ((SPECIAL_SLOW_MULT + FREEZING_MIN_MULT) / 2) - 1);
 const SPECIAL_BEAM_TIME_PER_TILE = SPECIAL_LINGER * (1 / SPECIAL_SLOW_MULT - 1);
+const BEAM_LINGER_CAP = 1.5;
 const SPECIAL_GRAVITY_TIME_PER_TILE =
   SPECIAL_LINGER * (1 / ((GRAVITY_MIN_MULT + GRAVITY_MAX_MULT) / 2) - 1);
 const SPECIAL_LIGHTNING_TIME = LIGHTNING_STUN;
@@ -1946,8 +1948,114 @@ function sweepAiWeights(seed, samples = 50, options = {}) {
   Object.assign(aiWeights, snapshot);
   if (typeof console !== "undefined" && console.table) {
     console.table(report);
+    const ranking = rankSweepReport(report, options);
+    if (ranking.length) {
+      console.log("Top by simulated/objective:", ranking.slice(0, 5));
+    }
   }
   return report;
+}
+
+function tuneAiWeights(seed, samples = 8, options = {}) {
+  const weightKeys = Object.keys(AI_WEIGHT_DEFAULTS);
+  const baseline = { ...aiWeights };
+  const range = options.range != null ? Number(options.range) : 1.1;
+  const gapWeight = options.gapWeight != null ? Number(options.gapWeight) : 0;
+  const apply = options.apply !== false;
+  let best = { score: -Infinity, weights: baseline, result: null };
+  const candidates = [baseline];
+  for (let i = 1; i < samples; i++) {
+    const candidate = {};
+    weightKeys.forEach((key) => {
+      candidate[key] = sampleWeight(AI_WEIGHT_DEFAULTS[key], range);
+    });
+    candidates.push(candidate);
+  }
+  candidates.forEach((weights, idx) => {
+    setAiWeights(weights);
+    const results = evaluateAiSeed(seed, 1, true);
+    const res = results[0] || {};
+    const predicted = res.predictedTime || 0;
+    const simulated = res.simulatedTime || 0;
+    const gap = Math.abs(simulated - predicted);
+    const score = simulated - gapWeight * gap;
+    if (score > best.score) {
+      best = { score, weights: { ...weights }, result: res, idx };
+    }
+  });
+  if (apply) {
+    setAiWeights(best.weights);
+  }
+  if (typeof console !== "undefined") {
+    console.log("tuneAiWeights best", { ...best, applied: apply });
+  }
+  return { weights: { ...best.weights }, result: best.result, score: best.score };
+}
+
+function tuneAiWeightsForSeeds(seeds, samples = 8, options = {}) {
+  const seedList = Array.isArray(seeds)
+    ? seeds
+    : typeof seeds === "string"
+    ? seeds
+        .split(/[\s,;]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  if (!seedList.length) return null;
+  const runs = options.runs != null ? Math.max(1, options.runs | 0) : 1;
+  const minWeight = options.minWeight != null ? Number(options.minWeight) : 0.4;
+  let best = null;
+  for (let i = 0; i < samples; i++) {
+    const weights =
+      i === 0 && options.includeCurrent !== false
+        ? { ...aiWeights }
+        : sampleWeightsVariant(options.range || 1.0);
+    setAiWeights(weights);
+    let total = 0;
+    let worst = Infinity;
+    seedList.forEach((seed) => {
+      const result = evaluateAiSeed(seed, runs, true)[0] || {};
+      const sim = result.simulatedTime || 0;
+      total += sim;
+      worst = Math.min(worst, sim);
+    });
+    const avg = total / seedList.length;
+    const score = minWeight * worst + (1 - minWeight) * avg;
+    if (!best || score > best.score) {
+      best = { score, avg, worst, weights: { ...weights } };
+    }
+  }
+  if (best) setAiWeights(best.weights);
+  if (typeof console !== "undefined") {
+    console.log("tuneAiWeightsForSeeds best", best);
+  }
+  return best;
+}
+
+function sampleWeightsVariant(range = 1.0) {
+  const variant = {};
+  Object.keys(AI_WEIGHT_DEFAULTS).forEach((key) => {
+    variant[key] = sampleWeight(AI_WEIGHT_DEFAULTS[key], range);
+  });
+  return variant;
+}
+
+function rankSweepReport(report, options = {}) {
+  const mode = options.rankBy || "objective";
+  const gapWeight = Number.isFinite(options.gapWeight) ? Number(options.gapWeight) : 0.6;
+  const bestWeight = Number.isFinite(options.bestSimWeight) ? Number(options.bestSimWeight) : 0.25;
+  const sorted = [...report];
+  const scorer = (entry) => {
+    const sim = entry.simulatedAvg || 0;
+    const best = entry.bestSimulated || sim;
+    const predicted = entry.predictedAvg || sim;
+    const gap = Math.abs(sim - predicted);
+    if (mode === "simulated") return sim;
+    if (mode === "bestSimulated") return best;
+    return sim + bestWeight * (best - sim) - gapWeight * gap;
+  };
+  sorted.sort((a, b) => scorer(b) - scorer(a));
+  return sorted;
 }
 
 function sampleWeight(base, range = 0.25) {
@@ -1978,7 +2086,18 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
     padHits[padType] = (padHits[padType] || 0) + 1;
   });
   const mandatorySpeeds = countMandatorySpeedPads(layout.grid, pathInfo.path);
-  const components = collectAiTimeComponents(layout.grid, pathInfo, layout.special, state.baseNeutralSpecials);
+  const prediction = estimatePredictedRunTime(
+    layout.grid,
+    pathInfo,
+    layout.special,
+    state.baseNeutralSpecials
+  );
+  const components = prediction.components || {
+    slowTime: 0,
+    slowStackTime: 0,
+    specialOwnedTime: 0,
+    specialNeutralTime: 0
+  };
   const simulated = simulateRunnerTime(layout.grid, layout.special, state.baseNeutralSpecials);
   const blockUsage = computeBlockUsageScore(layout.grid, pathInfo.path);
   const specialInfo = layout.special?.cell
@@ -1987,12 +2106,12 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
   return {
     seed,
     distance: Number(pathInfo.totalDistance.toFixed(2)),
-    predictedTime: Number((pathInfo.totalDistance / NPC_SPEED).toFixed(2)),
+    predictedTime: Number(prediction.time.toFixed(2)),
     simulatedTime: simulated != null ? Number(simulated.toFixed(2)) : null,
     mandatorySpeeds,
     padHits,
-    slowTime: Number(components.slowTime.toFixed(2)),
-    slowStack: Number(components.slowStackTime.toFixed(2)),
+    slowTime: Number((components.slowTime || 0).toFixed(2)),
+    slowStack: Number((components.slowStackTime || 0).toFixed(2)),
     blockUsage: Number(blockUsage.toFixed(3)),
     special: specialInfo,
     lookaheadUsed: layout.lookaheadUsed || 0
@@ -2038,6 +2157,45 @@ if (typeof window !== "undefined") {
   window.setAiWeights = setAiWeights;
   window.resetAiWeights = resetAiWeights;
   window.sweepAiWeights = sweepAiWeights;
+  window.tuneAiWeights = tuneAiWeights;
+  window.tuneAiWeightsForSeeds = tuneAiWeightsForSeeds;
+  window.sampleWeightsVariant = sampleWeightsVariant;
+  window.getAiWeights = () => ({ ...aiWeights });
+  window.previewGridMetrics = previewGridMetrics;
+}
+
+function previewGridMetrics(gridArray, specialSpec = null, neutralSpecials = null) {
+  const grid = cloneGrid(gridArray);
+  const special =
+    specialSpec && specialSpec.type && specialSpec.x != null && specialSpec.y != null
+      ? {
+          type: specialSpec.type,
+          placed: true,
+          cell: { x: Number(specialSpec.x), y: Number(specialSpec.y) },
+          effectTimer: 0,
+          cooldown: 0,
+          flashTimer: 0
+        }
+      : null;
+  const neutrals =
+    neutralSpecials != null
+      ? neutralSpecials.map((ns) => (ns ? cloneSpecial(ns) : null)).filter(Boolean)
+      : state.baseNeutralSpecials;
+  const pathInfo = analyzePath(grid);
+  const score = evaluateGridForAi(grid, special, neutrals, pathInfo);
+  const prediction = estimatePredictedRunTime(grid, pathInfo, special, neutrals);
+  return {
+    score,
+    predictedTime: prediction.time || 0,
+    baseTime: prediction.baseTime || 0,
+    slowTime: prediction.components?.slowTime || 0,
+    slowStack: prediction.components?.slowStackTime || 0,
+    specialOwned: prediction.components?.specialOwnedTime || 0,
+    specialNeutral: prediction.components?.specialNeutralTime || 0,
+    lightningPenalty: prediction.lightningPenalty || 0,
+    pathDistance: pathInfo?.totalDistance || 0,
+    special: special ? `${special.type}@(${special.cell.x + 1},${special.cell.y + 1})` : "none"
+  };
 }
 
 function createRunner(label, grid, special, neutralSpecials = []) {
@@ -3719,19 +3877,29 @@ function pathDistance(grid) {
 function evaluateGridForAi(grid, special = null, neutralSpecials = [], pathInfoOverride = null) {
   const info = pathInfoOverride || analyzePath(grid);
   if (!info) return -Infinity;
-  const components = collectAiTimeComponents(grid, info, special, neutralSpecials);
+  const prediction = estimatePredictedRunTime(grid, info, special, neutralSpecials);
+  const baseline = estimatePredictedRunTime(grid, info, null, neutralSpecials);
+  const components = prediction.components || {
+    slowTime: 0,
+    slowStackTime: 0,
+    specialOwnedTime: 0,
+    specialNeutralTime: 0
+  };
+  const predictedTime = prediction.time;
+  const baselineTime = baseline.time;
+  const specialDelta = Math.max(0, predictedTime - baselineTime);
   const pathContribution = (info.totalDistance / NPC_SPEED) * aiWeights.pathTime;
   const slowContribution = components.slowTime * aiWeights.slowTime;
   const slowStackContribution = components.slowStackTime * aiWeights.slowStack;
-  const ownedSpecialContribution =
-    components.specialOwnedTime * aiWeights.specialTime * PAD_TIME_TO_DISTANCE +
-    components.specialOwnedTime * SPECIAL_PLACEMENT_BONUS;
+  const specialImpactContribution =
+    specialDelta * aiWeights.specialTime * PAD_TIME_TO_DISTANCE +
+    specialDelta * SPECIAL_PLACEMENT_BONUS;
   const neutralSpecialContribution =
     components.specialNeutralTime * aiWeights.neutralSpecialTime * PAD_TIME_TO_DISTANCE;
   const interactionContribution = aiWeights.slowInteraction * components.slowTime * info.totalDistance;
   const blockUsageContribution =
     computeBlockUsageScore(grid, info.path) * aiWeights.blockUsage;
-  const lightningPenalty = computeLightningPadPenalty(grid, info, special) * aiWeights.lightningPadPenalty;
+  const lightningPenalty = prediction.lightningPenalty * aiWeights.lightningPadPenalty;
   const beamCrossContribution = computeBeamCrossings(info.path, special) * aiWeights.beamCrossings;
   return (
     info.totalDistance * AI_PATH_WEIGHT +
@@ -3739,7 +3907,7 @@ function evaluateGridForAi(grid, special = null, neutralSpecials = [], pathInfoO
     pathContribution +
     slowContribution +
     slowStackContribution +
-    ownedSpecialContribution +
+    specialImpactContribution +
     neutralSpecialContribution +
     interactionContribution +
     blockUsageContribution +
@@ -3832,6 +4000,7 @@ function computeBlockUsageScore(grid, path) {
 function computeLightningPadPenalty(grid, pathInfo, special) {
   if (!special?.placed || special.type !== "lightning") return 0;
   let penalty = 0;
+  const zapWindow = LIGHTNING_COOLDOWN + LIGHTNING_STUN;
   iteratePathSegments(pathInfo, (cell, baseTime) => {
     if (!isInsideGrid(cell.x, cell.y)) return;
     const padType = padTypeFromCell(grid[cell.y]?.[cell.x]);
@@ -3841,9 +4010,14 @@ function computeLightningPadPenalty(grid, pathInfo, special) {
       special.cell.x + 0.5 - center.x,
       special.cell.y + 0.5 - center.y
     );
-    if (dist <= SPECIAL_RADIUS) {
-      penalty += baseTime;
-    }
+    const overlap =
+      dist <= SPECIAL_RADIUS + NPC_RADIUS
+        ? Math.max(0, SPECIAL_RADIUS + NPC_RADIUS - dist) / (SPECIAL_RADIUS + NPC_RADIUS)
+        : 0;
+    if (overlap <= 0) return;
+    const hitChance = Math.min(1, (baseTime / zapWindow) * overlap);
+    const expectedStun = LIGHTNING_STUN * hitChance;
+    penalty += expectedStun * 0.7;
   });
   return penalty;
 }
@@ -3931,12 +4105,14 @@ function estimateBeamSlowTime(pathInfo, special, orientation) {
         ? cell.y === special.cell.y
         : cell.x === special.cell.x;
     if (inside) {
-      linger = SPECIAL_LINGER;
-    } else if (linger > 0) {
-      linger = Math.max(0, linger - baseTime);
+      linger = BEAM_LINGER_CAP;
     }
+    const active = inside ? Math.min(baseTime, SPECIAL_LINGER) : Math.min(baseTime, linger);
     if (inside || linger > 0) {
-      total += baseTime * (1 / SPECIAL_SLOW_MULT - 1);
+      total += active * (1 / SPECIAL_SLOW_MULT - 1);
+    }
+    if (!inside && linger > 0) {
+      linger = Math.max(0, linger - baseTime);
     }
   });
   return total;
@@ -4053,6 +4229,18 @@ function collectAiTimeComponents(grid, pathInfo, special, neutralSpecials = []) 
     specialOwnedTime: specialUsage.owned,
     specialNeutralTime: specialUsage.neutral
   };
+}
+
+function estimatePredictedRunTime(grid, pathInfo, special, neutralSpecials = []) {
+  if (!pathInfo) {
+    return { time: 0, baseTime: 0, lightningPenalty: 0, components: null };
+  }
+  const components = collectAiTimeComponents(grid, pathInfo, special, neutralSpecials);
+  const baseTime = pathInfo.totalDistance / NPC_SPEED;
+  const lightningPenalty = computeLightningPadPenalty(grid, pathInfo, special);
+  const predictedTime =
+    baseTime + PREDICT_SLOW_SCALE * (components.slowTime + components.slowStackTime + lightningPenalty);
+  return { time: predictedTime, baseTime, lightningPenalty, components };
 }
 
 function estimateSpecialPadSynergyTime(grid, path, special) {
