@@ -1295,7 +1295,9 @@ function clearCurrentGameState() {
 const AI_ASYNC_YIELD_BUDGET = 1;
 const VS_WS_URL =
   typeof location !== "undefined"
-    ? "wss://pathofextile-production.up.railway.app"
+    ? location.protocol === "https:"
+      ? "wss://pathofextile-production.up.railway.app"
+      : "ws://localhost:8080"
     : "";
 const VS_BUILD_SECONDS = 60;
 
