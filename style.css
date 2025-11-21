@@ -152,9 +152,22 @@ body.vs-mode #editRetry {
   opacity: 0.8;
 }
 
-.vs-timer {
-  margin-top: 4px;
-  font-weight: 700;
+.vs-rematch {
+  margin-top: 6px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.vs-rematch button {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+#vsChoiceStatus {
+  font-size: 12px;
+  opacity: 0.8;
 }
 
 .controls button#specialButton:hover {

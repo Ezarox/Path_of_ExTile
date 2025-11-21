@@ -98,7 +98,16 @@ wss.on("connection", (ws) => {
       return;
     }
     if (type === "maze") {
-      broadcast(currentRoom, { type: "maze", payload: msg.payload });
+      // Relay only to the other player
+      rooms[currentRoom].players.forEach((p) => {
+        if (p !== ws) send(p, { type: "maze", payload: msg.payload });
+      });
+      return;
+    }
+    if (type === "rematch") {
+      rooms[currentRoom].players.forEach((p) => {
+        if (p !== ws) send(p, { type: "rematch", choice: msg.choice });
+      });
       return;
     }
     send(ws, { type: "error", error: "Unknown message type" });

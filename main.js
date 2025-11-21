@@ -339,7 +339,9 @@ const vsJoinBtn = document.getElementById("vsJoin");
 const vsRoomInput = document.getElementById("vsRoomInput");
 const vsReadyBtn = document.getElementById("vsReadyBtn");
 const vsStatusEl = document.getElementById("vsStatus");
-const vsTimerEl = document.getElementById("vsTimer");
+const vsTryAgainBtn = document.getElementById("vsTryAgain");
+const vsNewGameBtn = document.getElementById("vsNewGame");
+const vsChoiceStatus = document.getElementById("vsChoiceStatus");
 const seedControls = [
   document.querySelector(".seed-field"),
   document.getElementById("setSeed"),
@@ -394,7 +396,18 @@ const state = {
     ready: false,
     startsAt: null,
     timerId: null,
-    opponentMaze: null
+    opponentMaze: null,
+    role: null,
+    selfLabel: "You",
+    oppLabel: "Other Player",
+    selfShort: "You",
+    oppShort: "OPP",
+    buildStartsAt: null,
+    buildEndsAt: null,
+    waitingForStart: false,
+    choiceSelf: null,
+    choicePeer: null,
+    lastSeed: ""
   }
 };
 let padPulseTimer = 0;
@@ -465,6 +478,8 @@ function setupListeners() {
   vsCreateBtn?.addEventListener("click", () => connectVs("create"));
   vsJoinBtn?.addEventListener("click", () => connectVs("join", vsRoomInput?.value?.trim()));
   vsReadyBtn?.addEventListener("click", () => sendVsReady());
+  vsTryAgainBtn?.addEventListener("click", () => setVsChoice("same"));
+  vsNewGameBtn?.addEventListener("click", () => setVsChoice("new"));
   document.addEventListener("keydown", (evt) => {
     if (evt.key === "Escape" && state.catalogueOpen) {
       closeCatalogue();
@@ -611,12 +626,22 @@ function handleVsEvent(evt) {
     updateVsStatus(`Room ${evt.room} created. Share code and press Ready.`);
     if (vsRoomInput) vsRoomInput.value = evt.room;
     setVsWaitingTimer();
+    state.vs.role = "host";
+    state.vs.selfLabel = "Player 1";
+    state.vs.oppLabel = "Player 2";
+    state.vs.selfShort = "P1";
+    state.vs.oppShort = "P2";
     return;
   }
   if (evt.type === "joined") {
     state.vs.room = evt.room;
     updateVsStatus(`Joined room ${evt.room}. Press Ready.`);
     setVsWaitingTimer();
+    state.vs.role = "guest";
+    state.vs.selfLabel = "Player 2";
+    state.vs.oppLabel = "Player 1";
+    state.vs.selfShort = "P2";
+    state.vs.oppShort = "P1";
     return;
   }
   if (evt.type === "peer-joined") {
@@ -635,7 +660,12 @@ function handleVsEvent(evt) {
   if (evt.type === "start") {
     state.vs.startsAt = evt.startsAt;
     updateVsStatus("Match starting...");
-    startGame((evt.seed || Date.now().toString()));
+    const useSeed =
+      state.vs.choiceSelf === "same" && state.vs.choicePeer === "same"
+        ? state.vs.lastSeed || evt.seed || Date.now().toString()
+        : evt.seed || Date.now().toString();
+    state.vs.lastSeed = useSeed;
+    startGame(useSeed);
     canvas.classList.remove("vs-waiting");
     startVsCountdown(evt.startsAt, evt.buildSeconds || VS_BUILD_SECONDS);
     return;
@@ -644,6 +674,12 @@ function handleVsEvent(evt) {
     state.vs.opponentMaze = evt.payload;
     updateVsStatus("Opponent maze received.");
     maybeStartVsRace();
+    return;
+  }
+  if (evt.type === "rematch") {
+    state.vs.choicePeer = evt.choice || null;
+    updateVsChoiceStatus();
+    checkVsChoiceReady();
     return;
   }
   if (evt.type === "error") {
@@ -661,22 +697,20 @@ function startVsCountdown(startsAt, buildSeconds) {
     clearInterval(state.vs.timerId);
     state.vs.timerId = null;
   }
+  state.vs.buildStartsAt = startsAt;
+  state.vs.buildEndsAt = startsAt + buildSeconds * 1000;
+  state.vs.waitingForStart = false;
   const endAt = startsAt + buildSeconds * 1000;
   const tick = () => {
     const now = Date.now();
-    if (now < startsAt) {
-      const pre = Math.max(0, Math.ceil((startsAt - now) / 1000));
-      if (vsTimerEl) vsTimerEl.textContent = `Starting in ${pre}s`;
-      return;
-    }
     const remaining = Math.max(0, Math.ceil((endAt - now) / 1000));
-    if (vsTimerEl) vsTimerEl.textContent = `Build: ${remaining}s`;
     if (remaining <= 0) {
       clearInterval(state.vs.timerId);
       state.vs.timerId = null;
       lockPlayerBuild();
       sendVsMaze();
       maybeStartVsRace();
+      updateVsChoiceStatus();
     }
   };
   tick();
@@ -689,6 +723,7 @@ function lockPlayerBuild() {
 
 function sendVsMaze() {
   if (!state.vs.room) return;
+  state.vs.lastSeed = state.seed;
   const payload = {
     grid: state.playerGrid,
     special: state.playerSpecial
@@ -1230,7 +1265,8 @@ function setVsWaitingTimer() {
   const timerEl = document.getElementById("timer");
   const statusEl = document.getElementById("timerStatus");
   if (statusEl) statusEl.textContent = "Waiting for other player";
-  if (timerEl) timerEl.textContent = "Waiting for other player";
+  if (timerEl) timerEl.textContent = "--";
+  if (vsChoiceStatus) vsChoiceStatus.textContent = "";
 }
 
 function leaveVsMode() {
@@ -1290,6 +1326,33 @@ function clearCurrentGameState() {
   if (seedInput) seedInput.value = "";
   updateHud();
   clearCanvas();
+}
+
+function setVsChoice(choice) {
+  state.vs.choiceSelf = choice;
+  vsSendRematch(choice);
+  updateVsChoiceStatus();
+  checkVsChoiceReady();
+}
+
+function vsSendRematch(choice) {
+  if (!state.vs.room) return;
+  vsSend({ type: "rematch", room: state.vs.room, choice });
+}
+
+function updateVsChoiceStatus() {
+  if (!vsChoiceStatus) return;
+  const self = state.vs.choiceSelf ? `You: ${state.vs.choiceSelf}` : "You: -";
+  const peer = state.vs.choicePeer ? `Peer: ${state.vs.choicePeer}` : "Peer: -";
+  vsChoiceStatus.textContent = `${self} | ${peer}`;
+}
+
+function checkVsChoiceReady() {
+  if (!state.vs.choiceSelf || !state.vs.choicePeer) return;
+  if (state.vs.choiceSelf !== state.vs.choicePeer) return;
+  state.vs.waitingForStart = true;
+  setVsWaitingTimer();
+  sendVsReady();
 }
 
 const AI_ASYNC_YIELD_BUDGET = 1;
@@ -3826,15 +3889,20 @@ function updateHud() {
     timerEl.textContent = "--";
     timerStatusEl.textContent = "Paused";
   } else if (state.building) {
+    if (state.vs.active && state.vs.buildEndsAt) {
+      const now = Date.now();
+      const remaining = Math.max(0, (state.vs.buildEndsAt - now) / 1000);
+      state.buildTimeLeft = remaining;
+    }
     timerEl.textContent = `${Math.max(0, state.buildTimeLeft).toFixed(1)}s`;
-    timerStatusEl.textContent = "Build phase";
+    timerStatusEl.textContent = state.vs.active ? "VS build phase" : "Build phase";
   } else if (state.race && !state.race.finished) {
     const elapsed = state.race.elapsedTime || 0;
     timerEl.textContent = `${elapsed.toFixed(1)}s`;
-    timerStatusEl.textContent = "Race in progress";
+    timerStatusEl.textContent = state.vs.active ? "VS race in progress" : "Race in progress";
   } else if (state.race && state.race.finished && state.race.elapsed !== null) {
     timerEl.textContent = `${state.race.elapsed.toFixed(1)}s`;
-    timerStatusEl.textContent = "Race complete";
+    timerStatusEl.textContent = state.vs.active ? "VS race complete" : "Race complete";
   } else {
     timerEl.textContent = "--";
     timerStatusEl.textContent = "Ready";
