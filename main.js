@@ -65,6 +65,8 @@ const AI_PATH_WEIGHT = 12;
 const COMBO_POOL_LIMIT = 3;
 const COMBO_LOOKAHEAD_DEPTH = 2;
 const MIN_BLOCK_RECLAIM_DELTA = 1;
+const RECLAIM_RUNTIME_THRESHOLD = 1;
+const RECLAIM_MAX_PASSES = 2;
 const PAD_SLOW_EXTRA_TIME = PANEL_EFFECT_DURATION * (1 / PANEL_SLOW_MULT - 1);
 const PAD_SPEED_TIME_DELTA = PANEL_EFFECT_DURATION * (1 - 1 / PANEL_FAST_MULT);
 const PAD_STONE_EXTRA_TIME = 2 * (1 / MEDUSA_SLOW_MULT - 1);
@@ -102,7 +104,7 @@ const EARLY_PATH_CELLS = 35;
 const SPEED_DIVERSION_RADIUS = 3;
 const QUICK_REVIEW_TRIGGER = 4;
 const PLACEMENT_LOOKAHEAD_COUNT = 3;
-const LOOKAHEAD_BUDGET = 4;
+const LOOKAHEAD_BUDGET = 0;
 const LOOKAHEAD_INTERVAL = 1;
 const LOOKAHEAD_TRIGGER_THRESHOLD = 0.02;
 const PLACEMENT_LOOKAHEAD_WEIGHT = 0.2;
@@ -343,6 +345,8 @@ const state = {
   aiGrid: null,
   aiWalls: [],
   aiSingles: [],
+  aiPlacementOrder: [],
+  aiProfile: null,
   hoverCell: null,
   floatingTexts: [],
   buildMode: "normal",
@@ -787,6 +791,8 @@ function startRace(forceStart = false) {
     state.aiGrid = aiLayout.grid;
     state.aiSpecial = aiLayout.special;
     state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
+    state.aiPlacementOrder = aiLayout.placementOrder || [];
+    state.aiProfile = aiLayout.profile || null;
   }
 
   const playerRunner = createRunner("You", playerGrid, playerSpecial, state.baseNeutralSpecials);
@@ -833,6 +839,7 @@ function currentLookaheadBudget() {
 }
 
 function buildAiLayout() {
+  const t0 = performance.now();
   const grid = cloneGrid(state.baseGrid);
   const special = createSpecialTemplate(state.specialTemplate.type);
   const neutralSpecials = state.baseNeutralSpecials || [];
@@ -841,6 +848,7 @@ function buildAiLayout() {
   let currentScore = evaluateGridForAi(grid, special, neutralSpecials);
   state.aiWalls = [];
   state.aiSingles = [];
+  const placementOrder = [];
   const lookaheadState = {
     remaining: currentLookaheadBudget(),
     interval: LOOKAHEAD_INTERVAL,
@@ -848,9 +856,10 @@ function buildAiLayout() {
     used: 0
   };
   const maxIterations = Math.max(1, wallsLeft + singlesLeft);
+  const tPlaceStart = performance.now();
   for (let i = 0; i < maxIterations; i++) {
     if (wallsLeft <= 0 && singlesLeft <= 0) break;
-    const specialHotspots = computeSpecialHotspots(grid, special, neutralSpecials);
+    const specialHotspots = !special.placed ? computeSpecialHotspots(grid, special, neutralSpecials) : [];
     const placement = findBestAiPlacement(
       grid,
       currentScore,
@@ -868,24 +877,43 @@ function buildAiLayout() {
       ensureOpenings(grid);
       wallsLeft--;
       state.aiWalls.push({ x: placement.x, y: placement.y });
+      placementOrder.push({ type: "wall", row: placement.y + 1, column: placement.x + 1 });
     } else if (placement.type === "single" && singlesLeft > 0) {
       grid[placement.y][placement.x] = CELL_SINGLE;
       ensureOpenings(grid);
       state.aiSingles.push({ x: placement.x, y: placement.y });
       singlesLeft--;
+      placementOrder.push({ type: "single", row: placement.y + 1, column: placement.x + 1 });
     } else {
       break;
     }
     currentScore = placement.score;
   }
+  const tPlaceEnd = performance.now();
+  const tSpecialStart = performance.now();
   currentScore = reduceMandatorySpeedPads(grid, special, neutralSpecials, currentScore);
   const finalHotspots = computeSpecialHotspots(grid, special, neutralSpecials);
   placeAiSpecial(grid, special, neutralSpecials, finalHotspots);
-  const optimized = optimizeBlockReallocation(grid, special, neutralSpecials, finalHotspots);
-  if (optimized?.changed) {
-    currentScore = optimized.score;
+  if (special?.cell) {
+    placementOrder.push({ type: "special", row: special.cell.y + 1, column: special.cell.x + 1 });
   }
-  return { grid, special, lookaheadUsed: lookaheadState.used || 0 };
+  const tSpecialEnd = performance.now();
+  const tReclaimStart = performance.now();
+  const reclaimStats = reclaimAndReallocateBlocks(grid, special, neutralSpecials, placementOrder);
+  placementOrder.reallocations = reclaimStats.reallocated || 0;
+  placementOrder.reallocationPasses = reclaimStats.passes || 0;
+  annotatePlacementImpacts(grid, special, neutralSpecials, placementOrder);
+  const tReclaimEnd = performance.now();
+  const profile = {
+    totalMs: +(performance.now() - t0).toFixed(2),
+    placementMs: +(tPlaceEnd - tPlaceStart).toFixed(2),
+    specialMs: +(tSpecialEnd - tSpecialStart).toFixed(2),
+    reclaimMs: +(tReclaimEnd - tReclaimStart).toFixed(2),
+    lookaheadUsed: lookaheadState.used || 0,
+    placements: placementOrder.length
+  };
+  state.aiProfile = profile;
+  return { grid, special, lookaheadUsed: lookaheadState.used || 0, placementOrder, profile };
 }
 
 function findBestAiPlacement(
@@ -979,19 +1007,26 @@ function generateRandomCandidates(grid, count) {
 function findTopAiWallCandidates(grid, special, neutralSpecials, limit = 1) {
   const results = [];
   const basePath = computePath(grid);
+  if (!basePath.length) return results;
   const targeted = [];
   basePath.forEach((node) => {
+    for (let dx = -2; dx <= 0; dx++) {
+      for (let dy = -2; dy <= 0; dy++) {
+        targeted.push({ x: node.x + dx, y: node.y + dy });
+      }
+    }
     for (const [ox, oy] of [
-      [-1, -1],
-      [0, -1],
-      [-1, 0],
-      [0, 0]
+      [1, -2],
+      [2, -2],
+      [1, -1],
+      [2, -1],
+      [1, 0],
+      [2, 0]
     ]) {
       targeted.push({ x: node.x + ox, y: node.y + oy });
     }
   });
-  const wallCandidates = targeted.concat(generateRandomCandidates(grid, 160));
-  wallCandidates.forEach((cand) => {
+  targeted.forEach((cand) => {
     if (!canPlaceBlock(grid, cand.x, cand.y)) return;
     placeBlock(grid, cand.x, cand.y, CELL_PLAYER);
     ensureOpenings(grid);
@@ -1012,17 +1047,18 @@ function findTopAiSingleCandidates(
   limit = 1
 ) {
   const basePath = computePath(grid);
+  if (!basePath.length) return [];
   const singleCandidates = new Set();
   basePath.forEach((node) => {
     singleCandidates.add(key(node.x, node.y));
-    MOVES.forEach((move) => {
-      const nx = node.x + move.dx;
-      const ny = node.y + move.dy;
-      if (isInsideGrid(nx, ny)) singleCandidates.add(key(nx, ny));
-    });
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        const nx = node.x + dx;
+        const ny = node.y + dy;
+        if (isInsideGrid(nx, ny)) singleCandidates.add(key(nx, ny));
+      }
+    }
   });
-  const extras = generateRandomSingleCandidates(160);
-  extras.forEach((c) => singleCandidates.add(key(c.x, c.y)));
   if (forcedCells?.length) {
     forcedCells.forEach((cell) => {
       if (cell && isInsideGrid(cell.x, cell.y)) {
@@ -1310,6 +1346,252 @@ function optimizeBlockReallocation(grid, special, neutralSpecials, specialHotspo
   return { changed: false, score: baselineScore };
 }
 
+function reclaimAndReallocateBlocks(grid, special, neutralSpecials, placementOrder = []) {
+  if (!grid) return { reallocated: 0, passes: 0 };
+  if (!placementOrder || placementOrder.length < 8) {
+    return { reallocated: 0, passes: 0 };
+  }
+  let reallocated = 0;
+  let passes = 0;
+  for (let pass = 0; pass < RECLAIM_MAX_PASSES; pass++) {
+    passes++;
+    const baseline = simulateRunnerTime(grid, special, neutralSpecials);
+    if (baseline == null) break;
+    const remaining = [];
+    let reclaimedWalls = 0;
+    let reclaimedSingles = 0;
+    let reclaimedSpecial = false;
+    let reclaimedAny = false;
+    for (const entry of placementOrder) {
+      if (entry.type === "special") {
+        if (!special?.placed || !special.cell) continue;
+        const sx = special.cell.x;
+        const sy = special.cell.y;
+        grid[sy][sx] = CELL_EMPTY;
+        ensureOpenings(grid);
+        if (!hasPath(grid)) {
+          grid[sy][sx] = CELL_SPECIAL;
+          continue;
+        }
+        const sim = simulateRunnerTime(grid, null, neutralSpecials);
+        if (sim != null && baseline - sim < RECLAIM_RUNTIME_THRESHOLD) {
+          special.placed = false;
+          special.cell = null;
+          reclaimedSpecial = true;
+          reclaimedAny = true;
+        } else {
+          grid[sy][sx] = CELL_SPECIAL;
+          remaining.push(entry);
+          ensureOpenings(grid);
+        }
+        continue;
+      }
+      const x = entry.column != null ? entry.column - 1 : entry.x;
+      const y = entry.row != null ? entry.row - 1 : entry.y;
+      if (entry.type === "wall") {
+        clearBlock(grid, x, y);
+      } else {
+        if (grid[y]?.[x] !== CELL_SINGLE) {
+          remaining.push(entry);
+          continue;
+        }
+        grid[y][x] = CELL_EMPTY;
+      }
+      ensureOpenings(grid);
+      if (!hasPath(grid)) {
+        restoreBlock(grid, entry);
+        remaining.push(entry);
+        ensureOpenings(grid);
+        continue;
+      }
+      const sim = simulateRunnerTime(grid, special, neutralSpecials);
+      if (sim != null && baseline - sim < RECLAIM_RUNTIME_THRESHOLD) {
+        if (entry.type === "wall") reclaimedWalls++;
+        else reclaimedSingles++;
+        reclaimedAny = true;
+      } else {
+        restoreBlock(grid, entry);
+        ensureOpenings(grid);
+        remaining.push(entry);
+      }
+    }
+    placementOrder.length = 0;
+    placementOrder.push(...remaining);
+    if (!reclaimedWalls && !reclaimedSingles && !reclaimedSpecial) break;
+
+    // reallocate reclaimed blocks
+    let currentSim = simulateRunnerTime(grid, special, neutralSpecials);
+    const rejectedWalls = new Set();
+    const rejectedSingles = new Set();
+    let attempts = reclaimedWalls + reclaimedSingles + 10;
+    while ((reclaimedWalls > 0 || reclaimedSingles > 0) && attempts-- > 0) {
+      const placement = findBestAiPlacement(
+        grid,
+        evaluateGridForAi(grid, special, neutralSpecials),
+        special,
+        neutralSpecials,
+        reclaimedWalls > 0,
+        reclaimedSingles > 0
+      );
+      if (!placement) break;
+      const key = keyFor(placement.x, placement.y);
+      if (placement.type === "wall" && rejectedWalls.has(key)) {
+        attempts--;
+        continue;
+      }
+      if (placement.type === "single" && rejectedSingles.has(key)) {
+        attempts--;
+        continue;
+      }
+      const prevSim = currentSim;
+      let accepted = false;
+      if (placement.type === "wall" && reclaimedWalls > 0) {
+        placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
+        ensureOpenings(grid);
+        const sim = simulateRunnerTime(grid, special, neutralSpecials);
+        if (sim != null && (prevSim == null || sim - prevSim >= RECLAIM_RUNTIME_THRESHOLD)) {
+          placementOrder.push({ type: "wall", row: placement.y + 1, column: placement.x + 1 });
+          reclaimedWalls--;
+          reallocated++;
+          currentSim = sim != null ? sim : prevSim;
+          accepted = true;
+        } else {
+          clearBlock(grid, placement.x, placement.y);
+          ensureOpenings(grid);
+          rejectedWalls.add(key);
+        }
+      } else if (placement.type === "single" && reclaimedSingles > 0) {
+        grid[placement.y][placement.x] = CELL_SINGLE;
+        ensureOpenings(grid);
+        const sim = simulateRunnerTime(grid, special, neutralSpecials);
+        if (sim != null && (prevSim == null || sim - prevSim >= RECLAIM_RUNTIME_THRESHOLD)) {
+          placementOrder.push({ type: "single", row: placement.y + 1, column: placement.x + 1 });
+          reclaimedSingles--;
+          reallocated++;
+          currentSim = sim != null ? sim : prevSim;
+          accepted = true;
+        } else {
+          grid[placement.y][placement.x] = CELL_EMPTY;
+          ensureOpenings(grid);
+          rejectedSingles.add(key);
+        }
+      } else {
+        break;
+      }
+      if (!accepted) continue;
+    }
+    // Fallback: place remaining reclaimed blocks only if they don't reduce sim time
+    let fallbackAttempts = reclaimedWalls + reclaimedSingles + 20;
+    while ((reclaimedWalls > 0 || reclaimedSingles > 0) && fallbackAttempts-- > 0) {
+      const placement = findBestAiPlacement(
+        grid,
+        evaluateGridForAi(grid, special, neutralSpecials),
+        special,
+        neutralSpecials,
+        reclaimedWalls > 0,
+        reclaimedSingles > 0
+      );
+      if (!placement) break;
+      const prevSim = currentSim;
+      if (placement.type === "wall" && reclaimedWalls > 0) {
+        placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
+        ensureOpenings(grid);
+        const sim = simulateRunnerTime(grid, special, neutralSpecials);
+        if (sim != null && (prevSim == null || sim - prevSim >= 0)) {
+          placementOrder.push({ type: "wall", row: placement.y + 1, column: placement.x + 1 });
+          reclaimedWalls--;
+          reallocated++;
+          currentSim = sim != null ? sim : prevSim;
+        } else {
+          clearBlock(grid, placement.x, placement.y);
+          ensureOpenings(grid);
+        }
+      } else if (placement.type === "single" && reclaimedSingles > 0) {
+        grid[placement.y][placement.x] = CELL_SINGLE;
+        ensureOpenings(grid);
+        const sim = simulateRunnerTime(grid, special, neutralSpecials);
+        if (sim != null && (prevSim == null || sim - prevSim >= 0)) {
+          placementOrder.push({ type: "single", row: placement.y + 1, column: placement.x + 1 });
+          reclaimedSingles--;
+          reallocated++;
+          currentSim = sim != null ? sim : prevSim;
+        } else {
+          grid[placement.y][placement.x] = CELL_EMPTY;
+          ensureOpenings(grid);
+        }
+      } else {
+        break;
+      }
+    }
+    if (reclaimedSpecial && !special.placed) {
+      const hotspots = computeSpecialHotspots(grid, special, neutralSpecials);
+      placeAiSpecial(grid, special, neutralSpecials, hotspots);
+      if (special?.cell) {
+        placementOrder.push({ type: "special", row: special.cell.y + 1, column: special.cell.x + 1 });
+      }
+    }
+    if (!reclaimedAny && !reclaimedSpecial) break;
+  }
+  return { reallocated, passes };
+}
+
+function annotatePlacementImpacts(grid, special, neutralSpecials, placementOrder = []) {
+  if (!grid || !placementOrder?.length) return;
+  const baseline = simulateRunnerTime(grid, special, neutralSpecials);
+  if (baseline == null) return;
+  placementOrder.forEach((entry) => {
+    const x = entry.column != null ? entry.column - 1 : entry.x;
+    const y = entry.row != null ? entry.row - 1 : entry.y;
+    let sim = baseline;
+    if (entry.type === "wall") {
+      if (
+        grid[y]?.[x] !== CELL_PLAYER ||
+        grid[y + 1]?.[x] !== CELL_PLAYER ||
+        grid[y]?.[x + 1] !== CELL_PLAYER ||
+        grid[y + 1]?.[x + 1] !== CELL_PLAYER
+      ) {
+        entry.impactDelta = 0;
+        return;
+      }
+      const testGrid = cloneGrid(grid);
+      clearBlock(testGrid, x, y);
+      ensureOpenings(testGrid);
+      if (hasPath(testGrid)) {
+        sim = simulateRunnerTime(testGrid, special, neutralSpecials);
+      }
+    } else if (entry.type === "single") {
+      if (grid[y]?.[x] !== CELL_SINGLE) {
+        entry.impactDelta = 0;
+        return;
+      }
+      const testGrid = cloneGrid(grid);
+      testGrid[y][x] = CELL_EMPTY;
+      ensureOpenings(testGrid);
+      if (hasPath(testGrid)) {
+        sim = simulateRunnerTime(testGrid, special, neutralSpecials);
+      }
+    } else if (entry.type === "special") {
+      if (!special?.placed || special.cell == null) {
+        entry.impactDelta = 0;
+        return;
+      }
+      const testGrid = cloneGrid(grid);
+      const testSpecial = cloneSpecial(special);
+      const sx = testSpecial.cell.x;
+      const sy = testSpecial.cell.y;
+      testGrid[sy][sx] = CELL_EMPTY;
+      testSpecial.placed = false;
+      testSpecial.cell = null;
+      ensureOpenings(testGrid);
+      if (hasPath(testGrid)) {
+        sim = simulateRunnerTime(testGrid, testSpecial, neutralSpecials);
+      }
+    }
+    const delta = sim != null ? baseline - sim : 0;
+    entry.impactDelta = Number((delta || 0).toFixed(2));
+  });
+}
+
 function applyPlacementCandidate(grid, candidate) {
   if (candidate.type === "wall") {
     placeBlock(grid, candidate.x, candidate.y, CELL_PLAYER);
@@ -1329,6 +1611,17 @@ function revertPlacementCandidate(grid, candidate) {
     candidate.previous = null;
   }
   ensureOpenings(grid);
+}
+
+function restoreBlock(grid, entry) {
+  const x = entry.column != null ? entry.column - 1 : entry.x;
+  const y = entry.row != null ? entry.row - 1 : entry.y;
+  if (x == null || y == null) return;
+  if (entry.type === "wall") {
+    placeBlock(grid, x, y, CELL_PLAYER);
+  } else if (entry.type === "single") {
+    grid[y][x] = CELL_SINGLE;
+  }
 }
 
 function insertCandidate(list, candidate, limit) {
@@ -2342,6 +2635,7 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
     : "none";
   return {
     seed,
+    gridString: JSON.stringify(layout.grid),
     distance: Number(pathInfo.totalDistance.toFixed(2)),
     predictedTime: Number(prediction.time.toFixed(2)),
     simulatedTime: simulated != null ? Number(simulated.toFixed(2)) : null,
@@ -2399,6 +2693,7 @@ if (typeof window !== "undefined") {
   window.sampleWeightsVariant = sampleWeightsVariant;
   window.getAiWeights = () => ({ ...aiWeights });
   window.previewGridMetrics = previewGridMetrics;
+  window.getAiProfile = () => state.aiProfile || null;
 }
 
 function previewGridMetrics(gridArray, specialSpec = null, neutralSpecials = null) {
@@ -3979,7 +4274,7 @@ function isCellAvailableForSpecial(grid, gx, gy) {
   if (gx < 0 || gy < 0 || gx >= GRID_SIZE || gy >= GRID_SIZE) return false;
   if ((gy === 0 || gy === GRID_SIZE - 1) && gx === ENTRANCE_X) return false;
   const value = grid[gy][gx];
-  if ([CELL_STATIC, CELL_PLAYER, CELL_SPECIAL, CELL_SINGLE].includes(value)) return false;
+  if ([CELL_STATIC, CELL_STATIC_SPECIAL, CELL_PLAYER, CELL_SPECIAL, CELL_SINGLE].includes(value)) return false;
   if (isPadCell(value)) return false;
   return true;
 }
