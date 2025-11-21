@@ -6289,12 +6289,11 @@ function cloneNeutralSpecials(list) {
 
 function pickSpecialType(rng) {
   const roll = rng();
-  if (roll < 0.2) return "lightning";
-  if (roll < 0.4) return "radius";
-  if (roll < 0.6) return "gravity";
-  if (roll < 0.7) return "row";
-  if (roll < 0.8) return "column";
-  return "radius";
+  if (roll < 0.25) return "lightning";
+  if (roll < 0.50) return "radius";
+  if (roll < 0.75) return "gravity";
+  if (roll < 0.875) return "row";
+  return "column";
 }
 
 function isPointInsideSpecial(pos, special) {
