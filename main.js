@@ -815,6 +815,9 @@ function startVsFromMenu() {
     state.vs.waitingForStart = true;
     state.vs.choiceSelf = null;
     state.vs.choicePeer = null;
+    state.vs.rematchMode = null;
+    state.vs.buildStartsAt = null;
+    state.vs.buildEndsAt = null;
     vsPanel?.classList.remove("hidden");
     connectVs();
     hideLoadingOverlay();
@@ -1354,6 +1357,7 @@ function clearCurrentGameState() {
 }
 
 function setVsChoice(choice) {
+  if (!state.vs.active || state.vs.waitingForStart) return;
   state.vs.choiceSelf = choice;
   vsSendRematch(choice);
   updateVsChoiceStatus();
@@ -3614,16 +3618,17 @@ function recordResult(runner, time) {
 function decideWinner() {
   const player = state.results.player;
   const ai = state.results.ai;
+  const oppLabel = state.vs.active ? "Foe" : "AI";
   if (player == null && ai == null) {
     state.results.winner = "No valid runs";
   } else if (player == null) {
-    state.results.winner = state.vs.active ? "Foe wins!" : "AI wins!";
+    state.results.winner = `${oppLabel} wins!`;
   } else if (ai == null) {
     state.results.winner = "You win!";
   } else if (player > ai) {
     state.results.winner = "You win!";
   } else if (player < ai) {
-    state.results.winner = state.vs.active ? "Foe wins!" : "AI wins!";
+    state.results.winner = `${oppLabel} wins!`;
   } else {
     state.results.winner = "Tie!";
   }
@@ -3914,9 +3919,14 @@ function updateState(delta) {
   padPulseTimer = (padPulseTimer + delta) % PAD_PULSE_PERIOD;
   if (state.building) {
     if (!state.paused) {
-      state.buildTimeLeft = Math.max(0, state.buildTimeLeft - delta);
-      if (state.buildTimeLeft <= 0) {
-        startRace(true);
+      if (!state.vs.active) {
+        state.buildTimeLeft = Math.max(0, state.buildTimeLeft - delta);
+        if (state.buildTimeLeft <= 0) {
+          startRace(true);
+        }
+      } else if (state.vs.buildEndsAt) {
+        const now = Date.now();
+        state.buildTimeLeft = Math.max(0, (state.vs.buildEndsAt - now) / 1000);
       }
     }
   } else if (state.race && !state.paused && !state.race.finished) {
@@ -3964,7 +3974,7 @@ function updateHud() {
     timerEl.textContent = "--";
     timerStatusEl.textContent = "Ready";
   }
-  timerEl.classList.toggle("timer-warning", state.building && state.buildTimeLeft <= 10);
+  timerEl.classList.toggle("timer-warning", state.building && state.buildTimeLeft <= 20);
   if (scoreEl) scoreEl.textContent = formatScoreText();
   updateResourceCards();
 }
@@ -4649,6 +4659,29 @@ function handlePopupBackdrop(evt) {
   }
 }
 
+// Override result popup to use Foe labeling in VS mode
+function showResultPopup() {
+  if (!state.results.winner) return;
+  const { player, ai, winner } = state.results;
+  const oppLabel = state.vs.active ? "Foe" : "AI";
+  let emoji = "🙂";
+  if (winner.includes("You")) emoji = "😄";
+  else if (winner.includes("AI") || winner.includes("Foe")) emoji = "😞";
+  let detail = "";
+  if (player != null && ai != null) {
+    const diff = Math.abs(player - ai).toFixed(2);
+    detail = `${winner} by ${diff}s`;
+  } else {
+    detail = winner;
+  }
+  popupEmojiEl.textContent = emoji;
+  popupMessageEl.innerHTML = `${detail}<br><span class="popup-detail">You: ${
+    player == null ? "DNF" : player.toFixed(2)
+  }s &nbsp;|&nbsp; ${oppLabel}: ${ai == null ? "DNF" : ai.toFixed(2)}s</span>`;
+  resultPopup.classList.remove("hidden");
+  document.addEventListener("mousedown", handlePopupBackdrop, true);
+}
+
 function handleShareResult() {
   const shareText = buildShareText();
   if (!shareText) return;
@@ -4975,8 +5008,14 @@ function placePowerPanels(grid, rng) {
 
 function placeNeutralSpecial(grid, rng) {
   const roll = rng();
-  if (roll < 0.25) return null;
-  const type = roll < 0.5 ? "lightning" : roll < 0.75 ? "row" : "column";
+  // 20% none, 20% lightning, 20% radius, 20% gravity, 10% column, 10% row
+  if (roll < 0.2) return null;
+  let type = "lightning";
+  if (roll < 0.4) type = "lightning";
+  else if (roll < 0.6) type = "radius";
+  else if (roll < 0.8) type = "gravity";
+  else if (roll < 0.9) type = "column";
+  else type = "row";
   const cells = [];
   for (let y = 1; y < GRID_SIZE - 1; y++) {
     for (let x = 0; x < GRID_SIZE; x++) {
@@ -6250,11 +6289,12 @@ function cloneNeutralSpecials(list) {
 
 function pickSpecialType(rng) {
   const roll = rng();
-  if (roll < 0.25) return "radius";
-  if (roll < 0.5) return "lightning";
-  if (roll < 0.75) return "gravity";
-  if (roll < 0.875) return "row";
-  return "column";
+  if (roll < 0.2) return "lightning";
+  if (roll < 0.4) return "radius";
+  if (roll < 0.6) return "gravity";
+  if (roll < 0.7) return "row";
+  if (roll < 0.8) return "column";
+  return "radius";
 }
 
 function isPointInsideSpecial(pos, special) {
