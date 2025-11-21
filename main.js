@@ -80,6 +80,8 @@ const SPECIAL_RADIUS_TIME_PER_TILE =
   (FREEZING_BUILDUP / 2) * (1 / ((SPECIAL_SLOW_MULT + FREEZING_MIN_MULT) / 2) - 1);
 const SPECIAL_BEAM_TIME_PER_TILE = SPECIAL_LINGER * (1 / SPECIAL_SLOW_MULT - 1);
 const BEAM_LINGER_CAP = 1.5;
+const TOUCH_RIGHT_CLICK_DELAY = 450;
+const TOUCH_MOVE_CANCEL_DISTANCE = 10;
 const SPECIAL_GRAVITY_TIME_PER_TILE =
   SPECIAL_LINGER * (1 / ((GRAVITY_MIN_MULT + GRAVITY_MAX_MULT) / 2) - 1);
 const SPECIAL_LIGHTNING_TIME = LIGHTNING_STUN;
@@ -120,6 +122,10 @@ const BUILD_MODE_ORDER = ["normal", "single", "special"];
 let aiWorker = null;
 let aiWorkerJobCounter = 0;
 let aiBuildToken = 0;
+let touchHoldTimeout = null;
+let touchHoldStart = null;
+let touchHoldTriggered = false;
+let suppressClickAfterTouch = false;
 
 const MOVES = [
   { dx: 1, dy: 0, cost: 1, diagonal: false },
@@ -452,6 +458,10 @@ function setupListeners() {
   });
   canvas.addEventListener("click", handleCanvasClick);
   canvas.addEventListener("contextmenu", handleRightClick);
+  canvas.addEventListener("touchstart", handleTouchStart, { passive: false });
+  canvas.addEventListener("touchmove", handleTouchMove, { passive: false });
+  canvas.addEventListener("touchend", handleTouchEnd);
+  canvas.addEventListener("touchcancel", handleTouchEnd);
   canvas.addEventListener("mousemove", handleMouseMove);
   canvas.addEventListener("mouseleave", () => (state.hoverCell = null));
   popupCloseBtn.addEventListener("click", hideResultPopup);
@@ -861,6 +871,11 @@ function releaseSpecialWaitIfResources(prevWalls, prevSingles) {
 }
 
 function handleCanvasClick(evt) {
+  if (suppressClickAfterTouch) {
+    suppressClickAfterTouch = false;
+    evt.preventDefault?.();
+    return;
+  }
   if (!state.building) return;
   const cell = pointerToGrid(evt);
   if (!cell) return;
@@ -957,6 +972,54 @@ function handleRightClick(evt) {
   state.singleBlocks = Math.min(state.singleBlocks + 1, state.singleBudget);
   releaseSpecialWaitIfResources(state.coins, prevSingles);
   updateResourceCards();
+}
+
+function handleTouchStart(evt) {
+  if (evt.touches.length !== 1) return;
+  const touch = evt.touches[0];
+  touchHoldStart = { x: touch.clientX, y: touch.clientY };
+  touchHoldTriggered = false;
+  clearTimeout(touchHoldTimeout);
+  touchHoldTimeout = setTimeout(() => {
+    touchHoldTriggered = true;
+    suppressClickAfterTouch = true;
+    handleRightClick({
+      clientX: touchHoldStart.x,
+      clientY: touchHoldStart.y,
+      preventDefault: () => evt.preventDefault()
+    });
+  }, TOUCH_RIGHT_CLICK_DELAY);
+}
+
+function handleTouchMove(evt) {
+  if (!touchHoldStart) return;
+  if (evt.touches.length !== 1) {
+    cancelTouchHold();
+    return;
+  }
+  const touch = evt.touches[0];
+  const dx = Math.abs(touch.clientX - touchHoldStart.x);
+  const dy = Math.abs(touch.clientY - touchHoldStart.y);
+  if (dx > TOUCH_MOVE_CANCEL_DISTANCE || dy > TOUCH_MOVE_CANCEL_DISTANCE) {
+    cancelTouchHold();
+  }
+}
+
+function handleTouchEnd(evt) {
+  if (touchHoldTriggered) {
+    evt.preventDefault();
+    setTimeout(() => {
+      suppressClickAfterTouch = false;
+    }, 400);
+  }
+  cancelTouchHold();
+}
+
+function cancelTouchHold() {
+  clearTimeout(touchHoldTimeout);
+  touchHoldTimeout = null;
+  touchHoldStart = null;
+  touchHoldTriggered = false;
 }
 
 function handleMouseMove(evt) {
