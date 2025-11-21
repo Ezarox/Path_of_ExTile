@@ -62,6 +62,9 @@ const SPECIAL_BEAM_WEIGHT = 1.2;
 const SPECIAL_GRAVITY_WEIGHT = 0.9;
 const SPECIAL_LIGHTNING_WEIGHT = 2.5;
 const AI_PATH_WEIGHT = 12;
+const COMBO_POOL_LIMIT = 3;
+const COMBO_LOOKAHEAD_DEPTH = 2;
+const MIN_BLOCK_RECLAIM_DELTA = 1;
 const PAD_SLOW_EXTRA_TIME = PANEL_EFFECT_DURATION * (1 / PANEL_SLOW_MULT - 1);
 const PAD_SPEED_TIME_DELTA = PANEL_EFFECT_DURATION * (1 - 1 / PANEL_FAST_MULT);
 const PAD_STONE_EXTRA_TIME = 2 * (1 / MEDUSA_SLOW_MULT - 1);
@@ -88,7 +91,7 @@ const AI_WEIGHT_DEFAULTS = {
   neutralSpecialTime: 0.5,
   slowTime: 1,
   slowStack: 0.6,
-  slowInteraction: 0.046,
+  slowInteraction: 0.025,
   blockUsage: 2.5,
   lightningPadPenalty: 1.5,
   beamCrossings: 0.4
@@ -833,7 +836,6 @@ function buildAiLayout() {
   const grid = cloneGrid(state.baseGrid);
   const special = createSpecialTemplate(state.specialTemplate.type);
   const neutralSpecials = state.baseNeutralSpecials || [];
-  const specialHotspots = computeSpecialHotspots(grid, special, neutralSpecials);
   let wallsLeft = state.coinBudget;
   let singlesLeft = state.singleBudget || 0;
   let currentScore = evaluateGridForAi(grid, special, neutralSpecials);
@@ -848,6 +850,7 @@ function buildAiLayout() {
   const maxIterations = Math.max(1, wallsLeft + singlesLeft);
   for (let i = 0; i < maxIterations; i++) {
     if (wallsLeft <= 0 && singlesLeft <= 0) break;
+    const specialHotspots = computeSpecialHotspots(grid, special, neutralSpecials);
     const placement = findBestAiPlacement(
       grid,
       currentScore,
@@ -856,7 +859,8 @@ function buildAiLayout() {
       wallsLeft > 0,
       singlesLeft > 0,
       null,
-      lookaheadState
+      lookaheadState,
+      { wallsLeft, singlesLeft, specialHotspots }
     );
     if (!placement) break;
     if (placement.type === "wall" && wallsLeft > 0) {
@@ -875,7 +879,12 @@ function buildAiLayout() {
     currentScore = placement.score;
   }
   currentScore = reduceMandatorySpeedPads(grid, special, neutralSpecials, currentScore);
-  placeAiSpecial(grid, special, neutralSpecials, specialHotspots);
+  const finalHotspots = computeSpecialHotspots(grid, special, neutralSpecials);
+  placeAiSpecial(grid, special, neutralSpecials, finalHotspots);
+  const optimized = optimizeBlockReallocation(grid, special, neutralSpecials, finalHotspots);
+  if (optimized?.changed) {
+    currentScore = optimized.score;
+  }
   return { grid, special, lookaheadUsed: lookaheadState.used || 0 };
 }
 
@@ -887,18 +896,18 @@ function findBestAiPlacement(
   allowWalls = true,
   allowSingles = true,
   forcedSingleCells = null,
-  lookaheadState = null
+  lookaheadState = null,
+  budgetInfo = null
 ) {
   if (lookaheadState) {
     lookaheadState.index = (lookaheadState.index || 0) + 1;
   }
   const lookaheadEnabled = lookaheadState?.remaining > 0;
   const candidateLimit = lookaheadEnabled ? PLACEMENT_LOOKAHEAD_COUNT : 1;
-  const candidates = [];
+  const wallPool = [];
+  const singlePool = [];
   if (allowWalls) {
-    candidates.push(
-      ...findTopAiWallCandidates(grid, special, neutralSpecials, candidateLimit)
-    );
+    wallPool.push(...findTopAiWallCandidates(grid, special, neutralSpecials, candidateLimit));
   }
   if (allowSingles) {
     const steerCells = collectSpeedPadSteerCells(grid);
@@ -906,10 +915,9 @@ function findBestAiPlacement(
       forcedSingleCells && forcedSingleCells.length
         ? forcedSingleCells.concat(steerCells)
         : steerCells;
-    candidates.push(
-      ...findTopAiSingleCandidates(grid, special, neutralSpecials, forced, candidateLimit)
-    );
+    singlePool.push(...findTopAiSingleCandidates(grid, special, neutralSpecials, forced, candidateLimit));
   }
+  const candidates = wallPool.concat(singlePool);
   if (!candidates.length) return null;
   candidates.sort((a, b) => b.score - a.score);
   const topCandidate = candidates[0];
@@ -939,7 +947,22 @@ function findBestAiPlacement(
       best = candidate;
     }
   });
-  return best || topCandidate;
+  let pick = best || topCandidate;
+  if (budgetInfo) {
+    const sequenceChoice = evaluatePlacementSequences(
+      grid,
+      special,
+      neutralSpecials,
+      wallPool,
+      singlePool,
+      budgetInfo,
+      candidateLimit
+    );
+    if (sequenceChoice && sequenceChoice.score > (pick.lookaheadScore || pick.score || -Infinity)) {
+      pick = sequenceChoice.candidate;
+    }
+  }
+  return pick;
 }
 
 function generateRandomCandidates(grid, count) {
@@ -1071,6 +1094,220 @@ function evaluateCandidateWithLookahead(grid, special, neutralSpecials, candidat
   revertPlacementCandidate(grid, candidate);
   const bonus = Math.max(0, bestFollow - baseScore) * PLACEMENT_LOOKAHEAD_WEIGHT;
   return baseScore + bonus;
+}
+
+function evaluatePlacementSequences(
+  grid,
+  special,
+  neutralSpecials,
+  wallPool,
+  singlePool,
+  budgetInfo
+) {
+  if (!budgetInfo) return null;
+  const wallsLeft = budgetInfo.wallsLeft || 0;
+  const singlesLeft = budgetInfo.singlesLeft || 0;
+  const specialHotspots = budgetInfo.specialHotspots || [];
+  const pools = {
+    walls: wallPool.slice(0, COMBO_POOL_LIMIT),
+    singles: singlePool.slice(0, COMBO_POOL_LIMIT),
+    specials: !special.placed ? specialHotspots.slice(0, COMBO_POOL_LIMIT) : []
+  };
+  if (!pools.walls.length && !pools.singles.length && !pools.specials.length) return null;
+
+  let best = null;
+  const maxDepth = Math.max(1, Math.min(COMBO_LOOKAHEAD_DEPTH, wallsLeft + singlesLeft + (special.placed ? 0 : 1)));
+
+  function dfs(currentGrid, currentSpecial, wLeft, sLeft, depth, firstMoveUsed, usedSpecial) {
+    const score = evaluateGridForAi(currentGrid, currentSpecial, neutralSpecials);
+    if (depth === 0 || (!wLeft && !sLeft && (usedSpecial || currentSpecial?.placed))) {
+      if (!best || score > best.score) {
+        best = { score, candidate: firstMoveUsed };
+      }
+      return;
+    }
+    // walls
+    if (wLeft > 0) {
+      pools.walls.forEach((wall) => {
+        const nextGrid = cloneGrid(currentGrid);
+        placeBlock(nextGrid, wall.x, wall.y, CELL_PLAYER);
+        ensureOpenings(nextGrid);
+        if (!hasPath(nextGrid)) return;
+        const nextSpecial = currentSpecial ? cloneSpecial(currentSpecial) : null;
+        const move = firstMoveUsed || wall;
+        dfs(nextGrid, nextSpecial, wLeft - 1, sLeft, depth - 1, move, usedSpecial);
+      });
+    }
+    // singles
+    if (sLeft > 0) {
+      pools.singles.forEach((single) => {
+        const nextGrid = cloneGrid(currentGrid);
+        if (!canPlaceSingle(nextGrid, single.x, single.y)) return;
+        const prev = nextGrid[single.y][single.x];
+        nextGrid[single.y][single.x] = CELL_SINGLE;
+        ensureOpenings(nextGrid);
+        if (!hasPath(nextGrid)) {
+          nextGrid[single.y][single.x] = prev;
+          return;
+        }
+        const nextSpecial = currentSpecial ? cloneSpecial(currentSpecial) : null;
+        const move = firstMoveUsed || single;
+        dfs(nextGrid, nextSpecial, wLeft, sLeft - 1, depth - 1, move, usedSpecial);
+      });
+    }
+    // special
+    if (!usedSpecial && pools.specials.length && currentSpecial && !currentSpecial.placed) {
+      pools.specials.forEach((spot) => {
+        const [sx, sy] = [spot.x, spot.y];
+        if (!isCellAvailableForSpecial(currentGrid, sx, sy)) return;
+        const nextGrid = cloneGrid(currentGrid);
+        nextGrid[sy][sx] = CELL_SPECIAL;
+        ensureOpenings(nextGrid);
+        if (!hasPath(nextGrid)) return;
+        const nextSpecial = currentSpecial ? cloneSpecial(currentSpecial) : null;
+        nextSpecial.cell = { x: sx, y: sy };
+        nextSpecial.placed = true;
+        nextSpecial.effectTimer = 0;
+        nextSpecial.cooldown = 0;
+        nextSpecial.flashTimer = 0;
+        const move = firstMoveUsed || { type: "special", x: sx, y: sy, score: spot.score || 0 };
+        dfs(nextGrid, nextSpecial, wLeft, sLeft, depth - 1, move, true);
+      });
+    }
+  }
+
+  const startGrid = cloneGrid(grid);
+  const startSpecial = special ? cloneSpecial(special) : { placed: false };
+  dfs(startGrid, startSpecial, wallsLeft, singlesLeft, maxDepth, null, !!special?.placed);
+  return best;
+}
+
+function optimizeBlockReallocation(grid, special, neutralSpecials, specialHotspots = []) {
+  const baselineScore = evaluateGridForAi(grid, special, neutralSpecials);
+  let weakest = null;
+
+  // Evaluate wall contributions
+  const walls = listAiWallOrigins(grid);
+  walls.forEach(({ x, y }) => {
+    clearBlock(grid, x, y);
+    ensureOpenings(grid);
+    if (!hasPath(grid)) {
+      placeBlock(grid, x, y, CELL_PLAYER);
+      ensureOpenings(grid);
+      return;
+    }
+    const score = evaluateGridForAi(grid, special, neutralSpecials);
+    const contribution = baselineScore - score;
+    if (!weakest || contribution < weakest.contribution) {
+      weakest = {
+        type: "wall",
+        x,
+        y,
+        contribution
+      };
+    }
+    placeBlock(grid, x, y, CELL_PLAYER);
+    ensureOpenings(grid);
+  });
+
+  // Evaluate single contributions
+  const singles = listAiSingleCells(grid);
+  singles.forEach(({ x, y }) => {
+    const prev = grid[y][x];
+    grid[y][x] = CELL_EMPTY;
+    ensureOpenings(grid);
+    if (!hasPath(grid)) {
+      grid[y][x] = prev;
+      ensureOpenings(grid);
+      return;
+    }
+    const score = evaluateGridForAi(grid, special, neutralSpecials);
+    const contribution = baselineScore - score;
+    if (!weakest || contribution < weakest.contribution) {
+      weakest = {
+        type: "single",
+        x,
+        y,
+        contribution,
+        prev
+      };
+    }
+    grid[y][x] = prev;
+    ensureOpenings(grid);
+  });
+
+  if (!weakest || weakest.contribution >= MIN_BLOCK_RECLAIM_DELTA) {
+    return { changed: false, score: baselineScore };
+  }
+
+  // Remove weakest block and try reallocating it
+  if (weakest.type === "wall") {
+    clearBlock(grid, weakest.x, weakest.y);
+  } else {
+    grid[weakest.y][weakest.x] = CELL_EMPTY;
+  }
+  ensureOpenings(grid);
+  if (!hasPath(grid)) {
+    // Should not happen, but revert if it does
+    if (weakest.type === "wall") {
+      placeBlock(grid, weakest.x, weakest.y, CELL_PLAYER);
+    } else {
+      grid[weakest.y][weakest.x] = weakest.prev;
+    }
+    ensureOpenings(grid);
+    return { changed: false, score: baselineScore };
+  }
+
+  const wallsLeft = weakest.type === "wall" ? 1 : 0;
+  const singlesLeft = weakest.type === "single" ? 1 : 0;
+  const placement = findBestAiPlacement(
+    grid,
+    evaluateGridForAi(grid, special, neutralSpecials),
+    special,
+    neutralSpecials,
+    wallsLeft > 0,
+    singlesLeft > 0,
+    null,
+    null,
+    { wallsLeft, singlesLeft, specialHotspots }
+  );
+
+  if (!placement) {
+    // Revert
+    if (weakest.type === "wall") {
+      placeBlock(grid, weakest.x, weakest.y, CELL_PLAYER);
+    } else {
+      grid[weakest.y][weakest.x] = weakest.prev;
+    }
+    ensureOpenings(grid);
+    return { changed: false, score: baselineScore };
+  }
+
+  // Apply new placement
+  if (placement.type === "wall") {
+    placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
+  } else if (placement.type === "single") {
+    grid[placement.y][placement.x] = CELL_SINGLE;
+  }
+  ensureOpenings(grid);
+  const newScore = evaluateGridForAi(grid, special, neutralSpecials);
+  if (newScore > baselineScore) {
+    return { changed: true, score: newScore };
+  }
+
+  // Revert to original if no improvement
+  if (placement.type === "wall") {
+    clearBlock(grid, placement.x, placement.y);
+  } else if (placement.type === "single") {
+    grid[placement.y][placement.x] = CELL_EMPTY;
+  }
+  if (weakest.type === "wall") {
+    placeBlock(grid, weakest.x, weakest.y, CELL_PLAYER);
+  } else {
+    grid[weakest.y][weakest.x] = weakest.prev;
+  }
+  ensureOpenings(grid);
+  return { changed: false, score: baselineScore };
 }
 
 function applyPlacementCandidate(grid, candidate) {
