@@ -117,6 +117,9 @@ const CARDINAL_NEIGHBORS = [
   [0, -1]
 ];
 const BUILD_MODE_ORDER = ["normal", "single", "special"];
+let aiWorker = null;
+let aiWorkerJobCounter = 0;
+let aiBuildToken = 0;
 
 const MOVES = [
   { dx: 1, dy: 0, cost: 1, diagonal: false },
@@ -477,6 +480,7 @@ function setupListeners() {
 
 function startGame(seedText) {
   applyVsVisibility(state.vs.active);
+  cancelAiBuild();
   let overlayStart = null;
   let overlayPlanned = false;
   let overlayHideFn = () => {};
@@ -530,9 +534,10 @@ function startGame(seedText) {
   setVsUiVisible(state.vs.active);
   // Kick off AI generation in the background (async, non-blocking) unless in VS mode.
   if (!state.vs.active) {
+    const buildToken = ++aiBuildToken;
     overlayStart = performance.now();
     overlayPlanned = true;
-    showLoadingOverlay("Building AI maze...");
+    showLoadingOverlay("Loading new seed...");
     overlayHideFn = () => {
       const elapsed = performance.now() - overlayStart;
       const delay = Math.max(0, 500 - elapsed);
@@ -541,6 +546,7 @@ function startGame(seedText) {
     state.aiBuildPromise = buildAiLayoutViaWorker()
       .catch(() => buildAiLayoutAsync())
       .then((aiLayout) => {
+        if (buildToken !== aiBuildToken) return null;
         if (!aiLayout) return null;
         state.aiGrid = aiLayout.grid;
         state.aiSpecial = aiLayout.special;
@@ -550,6 +556,7 @@ function startGame(seedText) {
         return aiLayout;
       })
       .finally(() => {
+        if (buildToken !== aiBuildToken) return;
         if (overlayPlanned) overlayHideFn();
       });
   } else {
@@ -734,6 +741,7 @@ function startFromMenu() {
   requestAnimationFrame(() => {
     state.vs.active = false;
     setVsUiVisible(false);
+    cancelAiBuild();
     clearCurrentGameState();
     applyVsVisibility(false);
     startGame(seedInput.value);
@@ -744,6 +752,7 @@ function startFromMenu() {
 function startVsFromMenu() {
   showLoadingOverlay("Preparing VS...");
   requestAnimationFrame(() => {
+    cancelAiBuild();
     clearCurrentGameState();
     state.vs.active = true;
     state.vs.room = null;
@@ -1372,9 +1381,6 @@ async function buildAiLayoutAsync() {
   return { grid, special, lookaheadUsed: lookaheadState.used || 0, placementOrder, profile };
 }
 
-let aiWorker = null;
-let aiWorkerJobCounter = 0;
-
 function ensureAiWorker() {
   if (aiWorker) return aiWorker;
   if (typeof Worker === "undefined") return null;
@@ -1386,6 +1392,17 @@ function ensureAiWorker() {
     aiWorker = null;
     return null;
   }
+}
+
+function cancelAiBuild() {
+  aiBuildToken++;
+  state.aiBuildPromise = null;
+  if (aiWorker) {
+    try {
+      aiWorker.terminate();
+    } catch (_) {}
+  }
+  aiWorker = null;
 }
 
 function buildAiLayoutViaWorker() {
@@ -4557,6 +4574,7 @@ function showMainMenu() {
   setSeedUiVisible(true);
   setVsUiVisible(false);
   applyVsVisibility(false);
+  cancelAiBuild();
   clearCurrentGameState();
 }
 

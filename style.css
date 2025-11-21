@@ -188,6 +188,10 @@ body.vs-mode #editRetry {
   gap: 6px;
 }
 
+body.vs-mode .ai-only {
+  display: none;
+}
+
 .canvas-wrapper {
   width: min(100%, 1380px);
 }
