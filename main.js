@@ -342,6 +342,7 @@ const vsStatusEl = document.getElementById("vsStatus");
 const vsTryAgainBtn = document.getElementById("vsTryAgain");
 const vsNewGameBtn = document.getElementById("vsNewGame");
 const vsChoiceStatus = document.getElementById("vsChoiceStatus");
+const timerStatusEl = document.getElementById("timerStatus");
 const seedControls = [
   document.querySelector(".seed-field"),
   document.getElementById("setSeed"),
@@ -399,15 +400,16 @@ const state = {
     opponentMaze: null,
     role: null,
     selfLabel: "You",
-    oppLabel: "Other Player",
+    oppLabel: "Foe",
     selfShort: "You",
-    oppShort: "OPP",
+    oppShort: "Foe",
     buildStartsAt: null,
     buildEndsAt: null,
     waitingForStart: false,
     choiceSelf: null,
     choicePeer: null,
-    lastSeed: ""
+    lastSeed: "",
+    rematchMode: null
   }
 };
 let padPulseTimer = 0;
@@ -460,7 +462,11 @@ function setupListeners() {
     window.close();
   });
   menuButton.addEventListener("click", () => {
-    if (state.vs.active) leaveVsMode();
+    if (state.vs.active) {
+      const ok = window.confirm("Leaving will exit the lobby. Continue?");
+      if (!ok) return;
+      leaveVsMode();
+    }
     showMainMenu();
   });
   resumeBtn.addEventListener("click", resumeGame);
@@ -627,8 +633,8 @@ function handleVsEvent(evt) {
     if (vsRoomInput) vsRoomInput.value = evt.room;
     setVsWaitingTimer();
     state.vs.role = "host";
-    state.vs.selfLabel = "Player 1";
-    state.vs.oppLabel = "Player 2";
+    state.vs.selfLabel = "You";
+    state.vs.oppLabel = "Foe";
     state.vs.selfShort = "P1";
     state.vs.oppShort = "P2";
     return;
@@ -638,8 +644,8 @@ function handleVsEvent(evt) {
     updateVsStatus(`Joined room ${evt.room}. Press Ready.`);
     setVsWaitingTimer();
     state.vs.role = "guest";
-    state.vs.selfLabel = "Player 2";
-    state.vs.oppLabel = "Player 1";
+    state.vs.selfLabel = "You";
+    state.vs.oppLabel = "Foe";
     state.vs.selfShort = "P2";
     state.vs.oppShort = "P1";
     return;
@@ -651,6 +657,9 @@ function handleVsEvent(evt) {
   }
   if (evt.type === "peer-left") {
     updateVsStatus("Peer left.");
+    alert("Peer disconnected from the lobby.");
+    state.vs.waitingForStart = true;
+    state.vs.opponentMaze = null;
     return;
   }
   if (evt.type === "ready") {
@@ -660,14 +669,25 @@ function handleVsEvent(evt) {
   if (evt.type === "start") {
     state.vs.startsAt = evt.startsAt;
     updateVsStatus("Match starting...");
+    const agreed = state.vs.choiceSelf && state.vs.choiceSelf === state.vs.choicePeer ? state.vs.choiceSelf : null;
+    state.vs.rematchMode = agreed;
+    state.vs.choiceSelf = null;
+    state.vs.choicePeer = null;
     const useSeed =
-      state.vs.choiceSelf === "same" && state.vs.choicePeer === "same"
-        ? state.vs.lastSeed || evt.seed || Date.now().toString()
-        : evt.seed || Date.now().toString();
+      agreed === "same" ? state.vs.lastSeed || evt.seed || Date.now().toString() : evt.seed || Date.now().toString();
     state.vs.lastSeed = useSeed;
-    startGame(useSeed);
-    canvas.classList.remove("vs-waiting");
-    startVsCountdown(evt.startsAt, evt.buildSeconds || VS_BUILD_SECONDS);
+    if (agreed === "same") {
+      editAndRetry();
+      state.vs.buildStartsAt = evt.startsAt;
+      state.vs.buildEndsAt = evt.startsAt + (evt.buildSeconds || VS_BUILD_SECONDS) * 1000;
+      state.vs.waitingForStart = false;
+      canvas.classList.remove("vs-waiting");
+      startVsCountdown(evt.startsAt, evt.buildSeconds || VS_BUILD_SECONDS);
+    } else {
+      startGame(useSeed);
+      canvas.classList.remove("vs-waiting");
+      startVsCountdown(evt.startsAt, evt.buildSeconds || VS_BUILD_SECONDS);
+    }
     return;
   }
   if (evt.type === "maze") {
@@ -794,6 +814,8 @@ function startVsFromMenu() {
     state.vs.opponentMaze = null;
     state.vs.startsAt = null;
     state.vs.waitingForStart = true;
+    state.vs.choiceSelf = null;
+    state.vs.choicePeer = null;
     vsPanel?.classList.remove("hidden");
     connectVs();
     hideLoadingOverlay();
@@ -1112,8 +1134,9 @@ async function startRace(forceStart = false) {
     }
   }
 
-  const playerRunner = createRunner("You", playerGrid, playerSpecial, state.baseNeutralSpecials);
-  const aiLabel = state.vs.active ? "Other Player" : "AI";
+  const playerLabel = state.vs.active ? state.vs.selfLabel || "You" : "You";
+  const playerRunner = createRunner(playerLabel, playerGrid, playerSpecial, state.baseNeutralSpecials);
+  const aiLabel = state.vs.active ? state.vs.oppLabel || "Foe" : "AI";
   const aiRunner = createRunner(aiLabel, state.aiGrid, cloneSpecial(state.aiSpecial), state.baseNeutralSpecials);
 
   if (!playerRunner.path.length || !aiRunner.path.length) {
@@ -1275,6 +1298,9 @@ function leaveVsMode() {
   state.vs.opponentMaze = null;
   state.vs.startsAt = null;
   state.vs.waitingForStart = false;
+  state.vs.choiceSelf = null;
+  state.vs.choicePeer = null;
+  state.vs.buildEndsAt = null;
   if (state.vs.timerId) {
     clearInterval(state.vs.timerId);
     state.vs.timerId = null;
@@ -1335,6 +1361,29 @@ function setVsChoice(choice) {
   checkVsChoiceReady();
 }
 
+function updateVsChoiceStatus() {
+  if (!vsChoiceStatus) return;
+  const self = state.vs.choiceSelf ? `You: ${state.vs.choiceSelf}` : "You: -";
+  const peer = state.vs.choicePeer ? `Peer: ${state.vs.choicePeer}` : "Peer: -";
+  vsChoiceStatus.textContent = `${self} | ${peer}`;
+}
+
+function checkVsChoiceReady() {
+  if (!state.vs.choiceSelf || !state.vs.choicePeer) return;
+  if (state.vs.choiceSelf !== state.vs.choicePeer) return;
+  state.vs.rematchMode = state.vs.choiceSelf;
+  state.vs.waitingForStart = true;
+  setVsWaitingTimer();
+  sendVsReady();
+}
+
+function setVsChoice(choice) {
+  state.vs.choiceSelf = choice;
+  vsSendRematch(choice);
+  updateVsChoiceStatus();
+  checkVsChoiceReady();
+}
+
 function vsSendRematch(choice) {
   if (!state.vs.room) return;
   vsSend({ type: "rematch", room: state.vs.room, choice });
@@ -1362,7 +1411,7 @@ const VS_WS_URL =
       ? "wss://pathofextile-production.up.railway.app"
       : "ws://localhost:8080"
     : "";
-const VS_BUILD_SECONDS = 60;
+const VS_BUILD_SECONDS = 90;
 
 async function buildAiLayoutAsync() {
   const t0 = performance.now();
@@ -1553,6 +1602,11 @@ function emitVsEvent(evt) {
 function vsSend(data) {
   if (!versusClient.ws || versusClient.ws.readyState !== WebSocket.OPEN) return;
   versusClient.ws.send(JSON.stringify(data));
+}
+
+function vsSendRematch(choice) {
+  if (!state.vs.room) return;
+  vsSend({ type: "rematch", room: state.vs.room, choice });
 }
 
 function vsCreateRoom() {
@@ -3547,8 +3601,12 @@ function updateRace(delta) {
 }
 
 function recordResult(runner, time) {
-  if (runner.label === "You") {
+  const isSelf = runner.label === "You";
+  const isFoe = runner.label === "Foe";
+  if (isSelf) {
     state.results.player = time;
+  } else if (isFoe) {
+    state.results.ai = time;
   } else {
     state.results.ai = time;
   }
@@ -3560,13 +3618,13 @@ function decideWinner() {
   if (player == null && ai == null) {
     state.results.winner = "No valid runs";
   } else if (player == null) {
-    state.results.winner = "AI wins!";
+    state.results.winner = state.vs.active ? "Foe wins!" : "AI wins!";
   } else if (ai == null) {
     state.results.winner = "You win!";
   } else if (player > ai) {
     state.results.winner = "You win!";
   } else if (player < ai) {
-    state.results.winner = "AI wins!";
+    state.results.winner = state.vs.active ? "Foe wins!" : "AI wins!";
   } else {
     state.results.winner = "Tie!";
   }
@@ -3907,6 +3965,7 @@ function updateHud() {
     timerEl.textContent = "--";
     timerStatusEl.textContent = "Ready";
   }
+  timerEl.classList.toggle("timer-warning", state.building && state.buildTimeLeft <= 10);
   if (scoreEl) scoreEl.textContent = formatScoreText();
   updateResourceCards();
 }
@@ -3956,8 +4015,9 @@ function formatScoreText() {
     return `${val.toFixed(2)}s`;
   };
   const playerText = formatVal(state.results.player);
-  const aiText = formatVal(state.results.ai);
-  return `Score: You ${playerText} | AI ${aiText}`;
+  const foeText = formatVal(state.results.ai);
+  const oppLabel = state.vs.active ? "Foe" : "AI";
+  return `Score: You ${playerText} | ${oppLabel} ${foeText}`;
 }
 
 function formatLabelScore(label) {
@@ -3969,7 +4029,7 @@ function formatLabelScore(label) {
   if (label.startsWith("You")) {
     return valFor(state.results.player);
   }
-  if (label.startsWith("AI")) {
+  if (label.startsWith("AI") || label.startsWith("Foe")) {
     return valFor(state.results.ai);
   }
   return "";
@@ -4002,11 +4062,11 @@ function getViewsForRender() {
         neutralSpecials: state.neutralSpecials
       },
       {
-        label: "AI Preview",
+        label: state.vs.active ? "Foe" : "AI Preview",
         grid: state.baseGrid,
         special: null,
         runner: null,
-        overlay: "AI layout revealed at race",
+        overlay: state.vs.active ? "Foe layout revealed at race" : "AI layout revealed at race",
         neutralSpecials: state.neutralSpecials
       }
     ];
@@ -4689,7 +4749,6 @@ function openCatalogue() {
   if (!catalogueOverlay || state.catalogueOpen) return;
   state.catalogueOpen = true;
   cataloguePrevPaused = state.paused;
-  state.paused = true;
   populateCatalogueList();
   catalogueOverlay.classList.remove("hidden");
 }

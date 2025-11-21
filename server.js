@@ -13,7 +13,7 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 8080;
-const COUNTDOWN_SECONDS = 60;
+const COUNTDOWN_SECONDS = 90;
 
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });

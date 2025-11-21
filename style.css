@@ -205,6 +205,11 @@ body.vs-mode .ai-only {
   display: none;
 }
 
+.timer-warning {
+  color: #ff6666 !important;
+  text-shadow: 0 0 6px rgba(255, 102, 102, 0.7);
+}
+
 .canvas-wrapper {
   width: min(100%, 1380px);
 }
