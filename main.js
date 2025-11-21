@@ -328,6 +328,26 @@ const popupMessageEl = document.getElementById("popupMessage");
 const popupEmojiEl = document.getElementById("popupEmoji");
 const popupCloseBtn = document.getElementById("closePopup");
 const shareResultBtn = document.getElementById("shareResult");
+const menuVsBtn = document.getElementById("menuVs");
+const vsToggleBtn = document.getElementById("vsToggle");
+const vsPanel = document.getElementById("vsPanel");
+const vsCreateBtn = document.getElementById("vsCreate");
+const vsJoinBtn = document.getElementById("vsJoin");
+const vsRoomInput = document.getElementById("vsRoomInput");
+const vsReadyBtn = document.getElementById("vsReadyBtn");
+const vsStatusEl = document.getElementById("vsStatus");
+const vsTimerEl = document.getElementById("vsTimer");
+const seedControls = [
+  document.querySelector(".seed-field"),
+  document.getElementById("setSeed"),
+  document.getElementById("randomSeed"),
+  document.getElementById("newGame"),
+  document.getElementById("editRetry")
+];
+const vsUiControls = [vsToggleBtn, vsPanel];
+function clearCanvas() {
+  ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+}
 
 const state = {
   rng: mulberry32(1),
@@ -363,7 +383,16 @@ const state = {
   mode: "menu",
   paused: false,
   waitingForSpecial: false,
-  catalogueOpen: false
+  catalogueOpen: false,
+  vs: {
+    active: false,
+    room: null,
+    connected: false,
+    ready: false,
+    startsAt: null,
+    timerId: null,
+    opponentMaze: null
+  }
 };
 let padPulseTimer = 0;
 let cataloguePrevPaused = false;
@@ -379,7 +408,9 @@ function setupListeners() {
   newGameBtn.addEventListener("click", () => startGame(seedInput.value.trim()));
   randomSeedBtn.addEventListener("click", () => {
     seedInput.value = Math.floor(Math.random() * 1e9).toString();
+    showLoadingOverlay("Loading new seed...");
     startGame(seedInput.value);
+    setTimeout(hideLoadingOverlay, 500);
   });
   setSeedBtn.addEventListener("click", () => {
     let value = seedInput.value.trim();
@@ -408,10 +439,12 @@ function setupListeners() {
   canvas.addEventListener("mouseleave", () => (state.hoverCell = null));
   popupCloseBtn.addEventListener("click", hideResultPopup);
   menuSingleBtn.addEventListener("click", () => startFromMenu());
+  menuVsBtn?.addEventListener("click", startVsFromMenu);
   menuQuitBtn.addEventListener("click", () => {
     window.close();
   });
   menuButton.addEventListener("click", () => {
+    if (state.vs.active) leaveVsMode();
     showMainMenu();
   });
   resumeBtn.addEventListener("click", resumeGame);
@@ -425,12 +458,17 @@ function setupListeners() {
     if (evt.target === catalogueOverlay) closeCatalogue();
   });
   shareResultBtn?.addEventListener("click", handleShareResult);
+  vsToggleBtn?.addEventListener("click", toggleVsPanel);
+  vsCreateBtn?.addEventListener("click", () => connectVs("create"));
+  vsJoinBtn?.addEventListener("click", () => connectVs("join", vsRoomInput?.value?.trim()));
+  vsReadyBtn?.addEventListener("click", () => sendVsReady());
   document.addEventListener("keydown", (evt) => {
     if (evt.key === "Escape" && state.catalogueOpen) {
       closeCatalogue();
       return;
     }
     if (evt.key === "Escape" && state.mode === "game") {
+      if (state.vs.active) return;
       if (state.paused) resumeGame();
       else showPause();
     }
@@ -438,6 +476,10 @@ function setupListeners() {
 }
 
 function startGame(seedText) {
+  applyVsVisibility(state.vs.active);
+  let overlayStart = null;
+  let overlayPlanned = false;
+  let overlayHideFn = () => {};
   const safeSeed = seedText || Date.now().toString();
   state.seed = safeSeed;
   seedInput.value = safeSeed;
@@ -455,6 +497,8 @@ function startGame(seedText) {
   state.aiSingles = [];
   state.aiBuildPromise = null;
   state.aiJobId = 0;
+  state.vs.opponentMaze = null;
+  state.vs.startsAt = null;
   state.coins = randomInt(state.rng, 10, 21);
   state.coinBudget = state.coins;
   const singleCount = state.rng() < 0.1 ? 2 : 1;
@@ -481,16 +525,178 @@ function startGame(seedText) {
   state.mode = "game";
   state.paused = false;
   hud.classList.remove("hidden");
-  // Kick off AI generation in the background (async, non-blocking).
-  state.aiBuildPromise = buildAiLayoutViaWorker().catch(() => buildAiLayoutAsync()).then((aiLayout) => {
-    if (!aiLayout) return null;
-    state.aiGrid = aiLayout.grid;
-    state.aiSpecial = aiLayout.special;
-    state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
-    state.aiPlacementOrder = aiLayout.placementOrder || [];
-    state.aiProfile = aiLayout.profile || null;
-    return aiLayout;
-  });
+  canvas.classList.remove("vs-waiting");
+  setSeedUiVisible(!state.vs.active);
+  setVsUiVisible(state.vs.active);
+  // Kick off AI generation in the background (async, non-blocking) unless in VS mode.
+  if (!state.vs.active) {
+    overlayStart = performance.now();
+    overlayPlanned = true;
+    showLoadingOverlay("Building AI maze...");
+    overlayHideFn = () => {
+      const elapsed = performance.now() - overlayStart;
+      const delay = Math.max(0, 500 - elapsed);
+      setTimeout(hideLoadingOverlay, delay);
+    };
+    state.aiBuildPromise = buildAiLayoutViaWorker()
+      .catch(() => buildAiLayoutAsync())
+      .then((aiLayout) => {
+        if (!aiLayout) return null;
+        state.aiGrid = aiLayout.grid;
+        state.aiSpecial = aiLayout.special;
+        state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
+        state.aiPlacementOrder = aiLayout.placementOrder || [];
+        state.aiProfile = aiLayout.profile || null;
+        return aiLayout;
+      })
+      .finally(() => {
+        if (overlayPlanned) overlayHideFn();
+      });
+  } else {
+    state.aiBuildPromise = null;
+    state.aiGrid = null;
+    state.aiSpecial = null;
+  }
+}
+
+function toggleVsPanel() {
+  if (vsPanel?.classList.contains("hidden")) {
+    vsPanel.classList.remove("hidden");
+    state.vs.active = true;
+    connectVs();
+  } else {
+    vsPanel.classList.add("hidden");
+    state.vs.active = false;
+  }
+}
+
+function connectVs(mode, roomCode = "") {
+  vsConnect(handleVsEvent);
+  state.vs.active = true;
+  vsPanel?.classList.remove("hidden");
+  if (mode === "create") {
+    vsCreateRoom();
+  } else if (mode === "join" && roomCode) {
+    vsJoinRoom(roomCode);
+  }
+  updateVsStatus("Connecting...");
+}
+
+function sendVsReady() {
+  if (!state.vs.room) return;
+  vsReady(state.vs.room);
+}
+
+function handleVsEvent(evt) {
+  if (evt.type === "connected") {
+    state.vs.connected = true;
+    updateVsStatus("Connected. Create or join a room.");
+    setVsWaitingTimer();
+    return;
+  }
+  if (evt.type === "disconnected") {
+    state.vs.connected = false;
+    updateVsStatus("Disconnected.");
+    return;
+  }
+  if (evt.type === "created") {
+    state.vs.room = evt.room;
+    updateVsStatus(`Room ${evt.room} created. Share code and press Ready.`);
+    if (vsRoomInput) vsRoomInput.value = evt.room;
+    setVsWaitingTimer();
+    return;
+  }
+  if (evt.type === "joined") {
+    state.vs.room = evt.room;
+    updateVsStatus(`Joined room ${evt.room}. Press Ready.`);
+    setVsWaitingTimer();
+    return;
+  }
+  if (evt.type === "peer-joined") {
+    updateVsStatus("Peer joined. Press Ready.");
+    setVsWaitingTimer();
+    return;
+  }
+  if (evt.type === "peer-left") {
+    updateVsStatus("Peer left.");
+    return;
+  }
+  if (evt.type === "ready") {
+    updateVsStatus(`Ready count: ${evt.count || 0}`);
+    return;
+  }
+  if (evt.type === "start") {
+    state.vs.startsAt = evt.startsAt;
+    updateVsStatus("Match starting...");
+    startGame((evt.seed || Date.now().toString()));
+    canvas.classList.remove("vs-waiting");
+    startVsCountdown(evt.startsAt, evt.buildSeconds || VS_BUILD_SECONDS);
+    return;
+  }
+  if (evt.type === "maze") {
+    state.vs.opponentMaze = evt.payload;
+    updateVsStatus("Opponent maze received.");
+    maybeStartVsRace();
+    return;
+  }
+  if (evt.type === "error") {
+    updateVsStatus(`Error: ${evt.error}`);
+    return;
+  }
+}
+
+function updateVsStatus(text) {
+  if (vsStatusEl) vsStatusEl.textContent = text;
+}
+
+function startVsCountdown(startsAt, buildSeconds) {
+  if (state.vs.timerId) {
+    clearInterval(state.vs.timerId);
+    state.vs.timerId = null;
+  }
+  const endAt = startsAt + buildSeconds * 1000;
+  const tick = () => {
+    const now = Date.now();
+    if (now < startsAt) {
+      const pre = Math.max(0, Math.ceil((startsAt - now) / 1000));
+      if (vsTimerEl) vsTimerEl.textContent = `Starting in ${pre}s`;
+      return;
+    }
+    const remaining = Math.max(0, Math.ceil((endAt - now) / 1000));
+    if (vsTimerEl) vsTimerEl.textContent = `Build: ${remaining}s`;
+    if (remaining <= 0) {
+      clearInterval(state.vs.timerId);
+      state.vs.timerId = null;
+      lockPlayerBuild();
+      sendVsMaze();
+      maybeStartVsRace();
+    }
+  };
+  tick();
+  state.vs.timerId = setInterval(tick, 200);
+}
+
+function lockPlayerBuild() {
+  state.building = false;
+}
+
+function sendVsMaze() {
+  if (!state.vs.room) return;
+  const payload = {
+    grid: state.playerGrid,
+    special: state.playerSpecial
+  };
+  vsSendMaze(state.vs.room, payload);
+  updateVsStatus("Sent your maze, waiting for opponent...");
+}
+
+function maybeStartVsRace() {
+  if (!state.vs.opponentMaze) return;
+  state.aiGrid = cloneGrid(state.vs.opponentMaze.grid || state.vs.opponentMaze);
+  state.aiSpecial = state.vs.opponentMaze.special ? cloneSpecial(state.vs.opponentMaze.special) : null;
+  state.aiBuildPromise = Promise.resolve();
+  startRace(true);
+  updateVsStatus("Running race!");
 }
 
 function editAndRetry() {
@@ -526,9 +732,36 @@ function resetPadStates(grid) {
 function startFromMenu() {
   showLoadingOverlay("Preparing...");
   requestAnimationFrame(() => {
+    state.vs.active = false;
+    setVsUiVisible(false);
+    clearCurrentGameState();
+    applyVsVisibility(false);
     startGame(seedInput.value);
+    hideMainMenu();
+  });
+}
+
+function startVsFromMenu() {
+  showLoadingOverlay("Preparing VS...");
+  requestAnimationFrame(() => {
+    clearCurrentGameState();
+    state.vs.active = true;
+    state.vs.room = null;
+    state.vs.opponentMaze = null;
+    state.vs.startsAt = null;
+    state.vs.waitingForStart = true;
+    vsPanel?.classList.remove("hidden");
+    connectVs();
     hideLoadingOverlay();
     hideMainMenu();
+    // Dim playfield while waiting
+    canvas.classList.add("vs-waiting");
+    setSeedUiVisible(false);
+    setVsUiVisible(true);
+    applyVsVisibility(true);
+    setVsWaitingTimer();
+    updateSpecialInfo();
+    updateHud();
   });
 }
 
@@ -542,6 +775,7 @@ function allStructuresPlaced() {
 
 function handlePlacementComplete(evt) {
   updateResourceCards();
+  if (state.vs.active) return;
   if (allStructuresPlaced()) {
     if (!state.playerSpecial.placed && evt) {
       addFloatingText("Structures placed! Add your special to begin.", evt, "#99ff99");
@@ -782,7 +1016,9 @@ function tryPlaceSpecial(grid, gx, gy, special) {
 }
 
 async function startRace(forceStart = false) {
-  if (!state.building) return;
+  if (state.vs.active) {
+    if (!forceStart && !state.vs.opponentMaze) return;
+  } else if (!state.building && !forceStart) return;
   if (!state.playerSpecial.placed && !forceStart) {
     if (!state.waitingForSpecial) {
       if (hasBuildResources()) {
@@ -802,32 +1038,39 @@ async function startRace(forceStart = false) {
   const playerSpecial = cloneSpecial(state.playerSpecial);
 
   if (!state.aiGrid || !state.aiSpecial) {
-    if (state.aiBuildPromise) {
-      try {
-        const aiLayout = await state.aiBuildPromise;
-        if (aiLayout) {
-          state.aiGrid = aiLayout.grid;
-          state.aiSpecial = aiLayout.special;
-          state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
-          state.aiPlacementOrder = aiLayout.placementOrder || [];
-          state.aiProfile = aiLayout.profile || null;
+    if (state.vs.active && state.vs.opponentMaze) {
+      state.aiGrid = cloneGrid(state.vs.opponentMaze.grid || state.vs.opponentMaze);
+      state.aiSpecial = state.vs.opponentMaze.special ? cloneSpecial(state.vs.opponentMaze.special) : null;
+      state.aiBuildPromise = Promise.resolve();
+    } else {
+      if (state.aiBuildPromise) {
+        try {
+          const aiLayout = await state.aiBuildPromise;
+          if (aiLayout) {
+            state.aiGrid = aiLayout.grid;
+            state.aiSpecial = aiLayout.special;
+            state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
+            state.aiPlacementOrder = aiLayout.placementOrder || [];
+            state.aiProfile = aiLayout.profile || null;
+          }
+        } catch (err) {
+          console.error("AI build failed, falling back to sync build", err);
         }
-      } catch (err) {
-        console.error("AI build failed, falling back to sync build", err);
       }
-    }
-    if (!state.aiGrid || !state.aiSpecial) {
-      const aiLayout = buildAiLayout();
-      state.aiGrid = aiLayout.grid;
-      state.aiSpecial = aiLayout.special;
-      state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
-      state.aiPlacementOrder = aiLayout.placementOrder || [];
-      state.aiProfile = aiLayout.profile || null;
+      if (!state.aiGrid || !state.aiSpecial) {
+        const aiLayout = buildAiLayout();
+        state.aiGrid = aiLayout.grid;
+        state.aiSpecial = aiLayout.special;
+        state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
+        state.aiPlacementOrder = aiLayout.placementOrder || [];
+        state.aiProfile = aiLayout.profile || null;
+      }
     }
   }
 
   const playerRunner = createRunner("You", playerGrid, playerSpecial, state.baseNeutralSpecials);
-  const aiRunner = createRunner("AI", state.aiGrid, cloneSpecial(state.aiSpecial), state.baseNeutralSpecials);
+  const aiLabel = state.vs.active ? "Other Player" : "AI";
+  const aiRunner = createRunner(aiLabel, state.aiGrid, cloneSpecial(state.aiSpecial), state.baseNeutralSpecials);
 
   if (!playerRunner.path.length || !aiRunner.path.length) {
     const fallbackPath = [
@@ -949,7 +1192,100 @@ function buildAiLayout() {
   return { grid, special, lookaheadUsed: lookaheadState.used || 0, placementOrder, profile };
 }
 
+function setSeedUiVisible(show) {
+  seedControls.forEach((el) => {
+    if (!el) return;
+    if (show) el.classList.remove("hidden");
+    else el.classList.add("hidden");
+  });
+}
+
+function setVsUiVisible(show) {
+  vsUiControls.forEach((el) => {
+    if (!el) return;
+    if (show) el.classList.remove("hidden");
+    else el.classList.add("hidden");
+  });
+}
+
+function applyVsVisibility(active) {
+  if (typeof document !== "undefined") {
+    document.body.classList.toggle("vs-mode", active);
+  }
+  if (!active) {
+    vsPanel?.classList.add("hidden");
+  }
+}
+
+function setVsWaitingTimer() {
+  const timerEl = document.getElementById("timer");
+  const statusEl = document.getElementById("timerStatus");
+  if (statusEl) statusEl.textContent = "Waiting for other player";
+  if (timerEl) timerEl.textContent = "Waiting for other player";
+}
+
+function leaveVsMode() {
+  state.vs.active = false;
+  state.vs.room = null;
+  state.vs.opponentMaze = null;
+  state.vs.startsAt = null;
+  state.vs.waitingForStart = false;
+  if (state.vs.timerId) {
+    clearInterval(state.vs.timerId);
+    state.vs.timerId = null;
+  }
+  canvas.classList.remove("vs-waiting");
+  setSeedUiVisible(true);
+  setVsUiVisible(false);
+  applyVsVisibility(false);
+  if (versusClient.ws) {
+    try {
+      versusClient.ws.close();
+    } catch (_) {}
+  }
+  versusClient.ws = null;
+  updateVsStatus("Disconnected.");
+}
+
+function clearCurrentGameState() {
+  state.building = false;
+  state.waitingForSpecial = false;
+  state.coins = 0;
+  state.coinBudget = 0;
+  state.singleBlocks = 0;
+  state.singleBudget = 0;
+  state.playerBlocks = [];
+  state.playerSingles = [];
+  state.playerGrid = createEmptyGrid();
+  state.baseGrid = createEmptyGrid();
+  state.baseNeutralSpecials = [];
+  state.neutralSpecials = [];
+  state.baseStaticCount = 0;
+  state.playerSpecial = null;
+  state.aiSpecial = null;
+  state.specialTemplate = null;
+  state.aiGrid = createEmptyGrid();
+  state.aiPlacementOrder = [];
+  state.aiProfile = null;
+  state.aiBuildPromise = null;
+  state.aiLookaheadUsed = 0;
+  state.aiJobId = 0;
+  state.aiWalls = [];
+  state.aiSingles = [];
+  state.results = { player: null, ai: null, winner: null };
+  state.race = null;
+  state.buildTimeLeft = 0;
+  state.hoverCell = null;
+  state.floatingTexts = [];
+  state.seed = "";
+  if (seedInput) seedInput.value = "";
+  updateHud();
+  clearCanvas();
+}
+
 const AI_ASYNC_YIELD_BUDGET = 1;
+const VS_WS_URL = typeof location !== "undefined" ? `ws://${location.hostname}:8080` : "";
+const VS_BUILD_SECONDS = 60;
 
 async function buildAiLayoutAsync() {
   const t0 = performance.now();
@@ -1094,6 +1430,60 @@ function buildAiLayoutViaWorker() {
     worker.addEventListener("error", handleError);
     worker.postMessage({ jobId, snapshot });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Versus mode WebSocket client (signaling only; gameplay integration TBD)
+// ---------------------------------------------------------------------------
+const versusClient = {
+  ws: null,
+  room: null,
+  onEvent: null
+};
+
+function vsConnect(onEvent = null) {
+  if (!VS_WS_URL) throw new Error("VS_WS_URL not set");
+  if (versusClient.ws && versusClient.ws.readyState === WebSocket.OPEN) return versusClient.ws;
+  versusClient.onEvent = onEvent;
+  const ws = new WebSocket(VS_WS_URL);
+  ws.onopen = () => emitVsEvent({ type: "connected" });
+  ws.onclose = () => emitVsEvent({ type: "disconnected" });
+  ws.onerror = (err) => emitVsEvent({ type: "error", error: err?.message || "ws error" });
+  ws.onmessage = (evt) => {
+    try {
+      const data = JSON.parse(evt.data);
+      emitVsEvent(data);
+    } catch (err) {
+      emitVsEvent({ type: "error", error: "bad message" });
+    }
+  };
+  versusClient.ws = ws;
+  return ws;
+}
+
+function emitVsEvent(evt) {
+  if (typeof versusClient.onEvent === "function") versusClient.onEvent(evt);
+}
+
+function vsSend(data) {
+  if (!versusClient.ws || versusClient.ws.readyState !== WebSocket.OPEN) return;
+  versusClient.ws.send(JSON.stringify(data));
+}
+
+function vsCreateRoom() {
+  vsSend({ type: "create" });
+}
+
+function vsJoinRoom(room) {
+  vsSend({ type: "join", room });
+}
+
+function vsReady(room) {
+  vsSend({ type: "ready", room });
+}
+
+function vsSendMaze(room, payload) {
+  vsSend({ type: "maze", room, payload });
 }
 
 function findBestAiPlacement(
@@ -2929,6 +3319,11 @@ if (typeof window !== "undefined") {
   window.getAiWeights = () => ({ ...aiWeights });
   window.previewGridMetrics = previewGridMetrics;
   window.getAiProfile = () => state.aiProfile || null;
+  window.vsConnect = vsConnect;
+  window.vsCreateRoom = vsCreateRoom;
+  window.vsJoinRoom = vsJoinRoom;
+  window.vsReady = vsReady;
+  window.vsSendMaze = vsSendMaze;
 }
 
 function previewGridMetrics(gridArray, specialSpec = null, neutralSpecials = null) {
@@ -3392,6 +3787,14 @@ function updateHud() {
   if (state.mode === "menu") {
     timerEl.textContent = "--";
     timerStatusEl.textContent = "Awaiting run";
+    if (scoreEl) scoreEl.textContent = "Score: --";
+    updateResourceCards();
+    return;
+  }
+
+  if (state.vs.active && state.vs.waitingForStart) {
+    timerEl.textContent = "--";
+    timerStatusEl.textContent = "Waiting for other player";
     if (scoreEl) scoreEl.textContent = "Score: --";
     updateResourceCards();
     return;
@@ -4046,6 +4449,12 @@ function getSpecialTypeName(type) {
 
 
 function updateSpecialInfo() {
+  if (!state.playerSpecial) {
+    if (specialInfoEl) specialInfoEl.textContent = "Special: --";
+    updateResourceCards();
+    renderSpecialPreview();
+    return;
+  }
   const status = state.playerSpecial.placed ? "placed" : "ready";
   if (specialInfoEl) {
     specialInfoEl.textContent = `Special: ${getSpecialTypeName(state.playerSpecial.type)} (${status})`;
@@ -4145,6 +4554,10 @@ function showMainMenu() {
   menuOverlay.classList.remove("hidden");
   pauseOverlay.classList.add("hidden");
   updateHud();
+  setSeedUiVisible(true);
+  setVsUiVisible(false);
+  applyVsVisibility(false);
+  clearCurrentGameState();
 }
 
 function hideMainMenu() {
@@ -4164,6 +4577,7 @@ function hideLoadingOverlay() {
 }
 
 function showPause() {
+  if (state.vs.active) return;
   state.paused = true;
   pauseOverlay.classList.remove("hidden");
   updateHud();
@@ -4443,8 +4857,21 @@ function maybeUpgradePadToSpecial(grid, cell, rng, baseType) {
 }
 
 function ensureOpenings(grid) {
+  clearBlockingAt(grid, ENTRANCE_X, 0);
+  clearBlockingAt(grid, ENTRANCE_X, GRID_SIZE - 1);
   grid[0][ENTRANCE_X] = CELL_EMPTY;
   grid[GRID_SIZE - 1][ENTRANCE_X] = CELL_EMPTY;
+}
+
+function clearBlockingAt(grid, x, y) {
+  const val = grid[y][x];
+  if (val === CELL_PLAYER) {
+    const anchorX = grid[y][x - 1] === CELL_PLAYER ? x - 1 : x;
+    const anchorY = grid[y - 1]?.[x] === CELL_PLAYER ? y - 1 : y;
+    clearBlock(grid, anchorX, anchorY);
+  } else if (val === CELL_SINGLE) {
+    grid[y][x] = CELL_EMPTY;
+  }
 }
 
 function isInsideGrid(x, y) {

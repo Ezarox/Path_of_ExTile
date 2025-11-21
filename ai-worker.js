@@ -204,9 +204,11 @@ function computePath(grid) {
 }
 
 function ensureOpenings(grid) {
-  // Keep entrance/exit clear.
-  const entY = GRID_SIZE - 1;
-  grid[entY][ENTRANCE_X] = grid[entY][ENTRANCE_X] === CELL_STATIC ? CELL_STATIC : CELL_EMPTY;
+  // Keep entrance/exit clear and remove overlapping blocks.
+  clearBlockingAt(grid, ENTRANCE_X, 0);
+  clearBlockingAt(grid, ENTRANCE_X, GRID_SIZE - 1);
+  grid[GRID_SIZE - 1][ENTRANCE_X] =
+    grid[GRID_SIZE - 1][ENTRANCE_X] === CELL_STATIC ? CELL_STATIC : CELL_EMPTY;
   grid[0][ENTRANCE_X] = grid[0][ENTRANCE_X] === CELL_STATIC ? CELL_STATIC : CELL_EMPTY;
 }
 
@@ -283,6 +285,7 @@ function canPlaceBlock(grid, gx, gy) {
     for (let x = gx; x <= gx + 1; x++) {
       const v = grid[y][x];
       if (v !== CELL_EMPTY) return false;
+      if ((y === 0 || y === GRID_SIZE - 1) && x === ENTRANCE_X) return false;
     }
   }
   return true;
@@ -306,6 +309,7 @@ function canPlaceSingle(grid, gx, gy) {
   if (!isInsideGrid(gx, gy)) return false;
   const v = grid[gy][gx];
   if (v !== CELL_EMPTY) return false;
+  if ((gy === 0 || gy === GRID_SIZE - 1) && gx === ENTRANCE_X) return false;
   return true;
 }
 

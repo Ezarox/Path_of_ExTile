@@ -104,6 +104,59 @@ html, body {
   background: #555;
 }
 
+.vs-only {
+  display: none;
+}
+
+body.vs-mode .vs-only {
+  display: inline-block;
+}
+
+/* Hide seed controls while in VS mode */
+body.vs-mode .seed-field,
+body.vs-mode #setSeed,
+body.vs-mode #randomSeed,
+body.vs-mode #newGame,
+body.vs-mode #editRetry {
+  display: none !important;
+}
+
+.vs-panel {
+  margin-top: 8px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: #eef2ff;
+}
+
+.vs-panel.hidden {
+  display: none;
+}
+
+.vs-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.vs-row input {
+  width: 120px;
+  padding: 4px 6px;
+}
+
+.vs-status {
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.vs-timer {
+  margin-top: 4px;
+  font-weight: 700;
+}
+
 .controls button#specialButton:hover {
   background: #a15ac7;
 }

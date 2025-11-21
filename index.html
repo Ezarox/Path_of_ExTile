@@ -14,6 +14,7 @@
     <div class="menu-card">
       <h1>Grid Rush</h1>
       <button id="menuSingle">Race vs AI</button>
+      <button id="menuVs">Player vs Player</button>
       <button id="menuQuit">Quit</button>
     </div>
   </div>
@@ -83,6 +84,17 @@
         <button id="editRetry" type="button">Edit & Retry</button>
         <button id="menuButton" type="button">Main Menu</button>
         <button id="catalogueButton" type="button" class="catalogue-button">Catalogue</button>
+        <button id="vsToggle" type="button" class="catalogue-button vs-only">Versus</button>
+      </div>
+      <div class="vs-panel hidden vs-only" id="vsPanel">
+        <div class="vs-row">
+          <button id="vsCreate" type="button">Create</button>
+          <input id="vsRoomInput" type="text" placeholder="Room code" />
+          <button id="vsJoin" type="button">Join</button>
+          <button id="vsReadyBtn" type="button">Ready</button>
+        </div>
+        <div class="vs-status" id="vsStatus">VS: disconnected</div>
+        <div class="vs-timer" id="vsTimer"></div>
       </div>
       <div class="hud-notes">
         <p>
