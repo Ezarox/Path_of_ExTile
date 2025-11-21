@@ -342,7 +342,6 @@ const vsStatusEl = document.getElementById("vsStatus");
 const vsTryAgainBtn = document.getElementById("vsTryAgain");
 const vsNewGameBtn = document.getElementById("vsNewGame");
 const vsChoiceStatus = document.getElementById("vsChoiceStatus");
-const timerStatusEl = document.getElementById("timerStatus");
 const seedControls = [
   document.querySelector(".seed-field"),
   document.getElementById("setSeed"),
