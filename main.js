@@ -348,6 +348,8 @@ const state = {
   aiSingles: [],
   aiPlacementOrder: [],
   aiProfile: null,
+  aiBuildPromise: null,
+  aiJobId: 0,
   hoverCell: null,
   floatingTexts: [],
   buildMode: "normal",
@@ -451,6 +453,8 @@ function startGame(seedText) {
   state.aiGrid = null;
   state.aiWalls = [];
   state.aiSingles = [];
+  state.aiBuildPromise = null;
+  state.aiJobId = 0;
   state.coins = randomInt(state.rng, 10, 21);
   state.coinBudget = state.coins;
   const singleCount = state.rng() < 0.1 ? 2 : 1;
@@ -477,6 +481,16 @@ function startGame(seedText) {
   state.mode = "game";
   state.paused = false;
   hud.classList.remove("hidden");
+  // Kick off AI generation in the background (async, non-blocking).
+  state.aiBuildPromise = buildAiLayoutViaWorker().catch(() => buildAiLayoutAsync()).then((aiLayout) => {
+    if (!aiLayout) return null;
+    state.aiGrid = aiLayout.grid;
+    state.aiSpecial = aiLayout.special;
+    state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
+    state.aiPlacementOrder = aiLayout.placementOrder || [];
+    state.aiProfile = aiLayout.profile || null;
+    return aiLayout;
+  });
 }
 
 function editAndRetry() {
@@ -767,7 +781,7 @@ function tryPlaceSpecial(grid, gx, gy, special) {
   return true;
 }
 
-function startRace(forceStart = false) {
+async function startRace(forceStart = false) {
   if (!state.building) return;
   if (!state.playerSpecial.placed && !forceStart) {
     if (!state.waitingForSpecial) {
@@ -788,12 +802,28 @@ function startRace(forceStart = false) {
   const playerSpecial = cloneSpecial(state.playerSpecial);
 
   if (!state.aiGrid || !state.aiSpecial) {
-    const aiLayout = buildAiLayout();
-    state.aiGrid = aiLayout.grid;
-    state.aiSpecial = aiLayout.special;
-    state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
-    state.aiPlacementOrder = aiLayout.placementOrder || [];
-    state.aiProfile = aiLayout.profile || null;
+    if (state.aiBuildPromise) {
+      try {
+        const aiLayout = await state.aiBuildPromise;
+        if (aiLayout) {
+          state.aiGrid = aiLayout.grid;
+          state.aiSpecial = aiLayout.special;
+          state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
+          state.aiPlacementOrder = aiLayout.placementOrder || [];
+          state.aiProfile = aiLayout.profile || null;
+        }
+      } catch (err) {
+        console.error("AI build failed, falling back to sync build", err);
+      }
+    }
+    if (!state.aiGrid || !state.aiSpecial) {
+      const aiLayout = buildAiLayout();
+      state.aiGrid = aiLayout.grid;
+      state.aiSpecial = aiLayout.special;
+      state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
+      state.aiPlacementOrder = aiLayout.placementOrder || [];
+      state.aiProfile = aiLayout.profile || null;
+    }
   }
 
   const playerRunner = createRunner("You", playerGrid, playerSpecial, state.baseNeutralSpecials);
@@ -917,6 +947,153 @@ function buildAiLayout() {
   };
   state.aiProfile = profile;
   return { grid, special, lookaheadUsed: lookaheadState.used || 0, placementOrder, profile };
+}
+
+const AI_ASYNC_YIELD_BUDGET = 1;
+
+async function buildAiLayoutAsync() {
+  const t0 = performance.now();
+  const grid = cloneGrid(state.baseGrid);
+  const special = createSpecialTemplate(state.specialTemplate.type);
+  const neutralSpecials = state.baseNeutralSpecials || [];
+  let wallsLeft = state.coinBudget;
+  let singlesLeft = state.singleBudget || 0;
+  let currentScore = evaluateGridForAi(grid, special, neutralSpecials);
+  state.aiWalls = [];
+  state.aiSingles = [];
+  const placementOrder = [];
+  const lookaheadState = {
+    remaining: currentLookaheadBudget(),
+    interval: LOOKAHEAD_INTERVAL,
+    index: 0,
+    used: 0
+  };
+  const maxIterations = Math.max(1, wallsLeft + singlesLeft);
+  const tPlaceStart = performance.now();
+  let lastYield = performance.now();
+  for (let i = 0; i < maxIterations; i++) {
+    if (wallsLeft <= 0 && singlesLeft <= 0) break;
+    if (performance.now() - lastYield > AI_ASYNC_YIELD_BUDGET) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      lastYield = performance.now();
+    }
+    const pathInfo = analyzePath(grid);
+    if (!pathInfo) break;
+    const specialHotspots = !special.placed ? computeSpecialHotspots(grid, special, neutralSpecials) : [];
+    const placement = findBestAiPlacement(
+      grid,
+      currentScore,
+      special,
+      neutralSpecials,
+      pathInfo,
+      lookaheadState,
+      { wallsLeft, singlesLeft, specialHotspots },
+      wallsLeft > 0,
+      singlesLeft > 0
+    );
+    if (!placement) break;
+    if (placement.type === "wall" && wallsLeft > 0) {
+      placeBlock(grid, placement.x, placement.y, CELL_PLAYER);
+      ensureOpenings(grid);
+      wallsLeft--;
+      state.aiWalls.push({ x: placement.x, y: placement.y });
+      placementOrder.push({ type: "wall", row: placement.y + 1, column: placement.x + 1 });
+    } else if (placement.type === "single" && singlesLeft > 0) {
+      grid[placement.y][placement.x] = CELL_SINGLE;
+      ensureOpenings(grid);
+      state.aiSingles.push({ x: placement.x, y: placement.y });
+      singlesLeft--;
+      placementOrder.push({ type: "single", row: placement.y + 1, column: placement.x + 1 });
+    } else {
+      break;
+    }
+    currentScore = placement.score;
+  }
+  const tPlaceEnd = performance.now();
+  const tSpecialStart = performance.now();
+  currentScore = reduceMandatorySpeedPads(grid, special, neutralSpecials, currentScore);
+  const finalHotspots = computeSpecialHotspots(grid, special, neutralSpecials);
+  placeAiSpecial(grid, special, neutralSpecials, finalHotspots);
+  if (special?.cell) {
+    placementOrder.push({ type: "special", row: special.cell.y + 1, column: special.cell.x + 1 });
+  }
+  const tSpecialEnd = performance.now();
+  const tReclaimStart = performance.now();
+  const reclaimStats = reclaimAndReallocateBlocks(grid, special, neutralSpecials, placementOrder);
+  placementOrder.reallocations = reclaimStats.reallocated || 0;
+  placementOrder.reallocationPasses = reclaimStats.passes || 0;
+  annotatePlacementImpacts(grid, special, neutralSpecials, placementOrder);
+  const tReclaimEnd = performance.now();
+  const profile = {
+    totalMs: +(performance.now() - t0).toFixed(2),
+    placementMs: +(tPlaceEnd - tPlaceStart).toFixed(2),
+    specialMs: +(tSpecialEnd - tSpecialStart).toFixed(2),
+    reclaimMs: +(tReclaimEnd - tReclaimStart).toFixed(2),
+    lookaheadUsed: lookaheadState.used || 0,
+    placements: placementOrder.length
+  };
+  state.aiProfile = profile;
+  return { grid, special, lookaheadUsed: lookaheadState.used || 0, placementOrder, profile };
+}
+
+let aiWorker = null;
+let aiWorkerJobCounter = 0;
+
+function ensureAiWorker() {
+  if (aiWorker) return aiWorker;
+  if (typeof Worker === "undefined") return null;
+  try {
+    aiWorker = new Worker("ai-worker.js");
+    return aiWorker;
+  } catch (err) {
+    console.warn("AI worker failed to start; falling back to main thread", err);
+    aiWorker = null;
+    return null;
+  }
+}
+
+function buildAiLayoutViaWorker() {
+  return new Promise((resolve, reject) => {
+    const worker = ensureAiWorker();
+    if (!worker) {
+      reject(new Error("Worker not available"));
+      return;
+    }
+    const jobId = ++aiWorkerJobCounter;
+    const snapshot = {
+      baseGrid: state.baseGrid,
+      baseNeutralSpecials: state.baseNeutralSpecials,
+      specialTemplate: state.specialTemplate,
+      coinBudget: state.coinBudget,
+      singleBudget: state.singleBudget,
+      rngSeed: hashSeed(state.seed || Date.now().toString())
+    };
+    const handleMessage = (evt) => {
+      const data = evt.data || {};
+      if (data.jobId !== jobId) return;
+      worker.removeEventListener("message", handleMessage);
+      worker.removeEventListener("error", handleError);
+      if (data.ok) {
+        resolve({
+          grid: data.grid,
+          special: data.special,
+          placementOrder: data.placementOrder,
+          profile: data.profile,
+          lookaheadUsed: data.lookaheadUsed
+        });
+      } else {
+        reject(new Error(data.error || "AI worker failed"));
+      }
+    };
+    const handleError = (err) => {
+      worker.removeEventListener("message", handleMessage);
+      worker.removeEventListener("error", handleError);
+      reject(err instanceof Error ? err : new Error("AI worker error"));
+    };
+    worker.addEventListener("message", handleMessage);
+    worker.addEventListener("error", handleError);
+    worker.postMessage({ jobId, snapshot });
+  });
 }
 
 function findBestAiPlacement(
