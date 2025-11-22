@@ -421,7 +421,11 @@ const state = {
 let padPulseTimer = 0;
 let cataloguePrevPaused = false;
 
-seedInput.value = Math.floor(Math.random() * 1e9).toString();
+function generateSeedString() {
+  return Math.floor(Math.random() * 1e9).toString();
+}
+
+seedInput.value = generateSeedString();
 setupListeners();
 prewarmAiWorker();
 showMainMenu();
@@ -432,13 +436,13 @@ requestAnimationFrame(loop);
 function setupListeners() {
   newGameBtn.addEventListener("click", () => startGame(seedInput.value.trim()));
   randomSeedBtn.addEventListener("click", () => {
-    seedInput.value = Math.floor(Math.random() * 1e9).toString();
+    seedInput.value = generateSeedString();
     startGame(seedInput.value);
   });
   setSeedBtn.addEventListener("click", () => {
     let value = seedInput.value.trim();
     if (!value) {
-      value = Math.floor(Math.random() * 1e9).toString();
+      value = generateSeedString();
       seedInput.value = value;
     }
     startGame(value);
@@ -511,7 +515,7 @@ function setupListeners() {
 function startGame(seedText) {
   applyVsVisibility(state.vs.active);
   cancelAiBuild();
-  const safeSeed = seedText || Date.now().toString();
+  const safeSeed = seedText?.trim() || generateSeedString();
   state.seed = safeSeed;
   seedInput.value = safeSeed;
   state.rng = mulberry32(hashSeed(safeSeed));
