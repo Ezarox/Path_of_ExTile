@@ -1598,47 +1598,13 @@ function cancelAiBuild() {
 }
 
 function buildAiLayoutViaWorker() {
-  return new Promise((resolve, reject) => {
-    const worker = ensureAiWorker();
-    if (!worker) {
-      reject(new Error("Worker not available"));
-      return;
-    }
-    const jobId = ++aiWorkerJobCounter;
-    const snapshot = {
-      baseGrid: state.baseGrid,
-      baseNeutralSpecials: state.baseNeutralSpecials,
-      specialTemplate: state.specialTemplate,
-      coinBudget: state.coinBudget,
-      singleBudget: state.singleBudget,
-      rngSeed: hashSeed(state.seed || Date.now().toString())
-    };
-    const handleMessage = (evt) => {
-      const data = evt.data || {};
-      if (data.jobId !== jobId) return;
-      worker.removeEventListener("message", handleMessage);
-      worker.removeEventListener("error", handleError);
-      if (data.ok) {
-        resolve({
-          grid: data.grid,
-          special: data.special,
-          placementOrder: data.placementOrder,
-          profile: { ...(data.profile || {}), source: "worker" },
-          lookaheadUsed: data.lookaheadUsed
-        });
-      } else {
-        reject(new Error(data.error || "AI worker failed"));
-      }
-    };
-    const handleError = (err) => {
-      worker.removeEventListener("message", handleMessage);
-      worker.removeEventListener("error", handleError);
-      reject(err instanceof Error ? err : new Error("AI worker error"));
-    };
-    worker.addEventListener("message", handleMessage);
-    worker.addEventListener("error", handleError);
-    worker.postMessage({ jobId, snapshot });
-  });
+  // Use the exact same logic as the main thread (no simplified worker build).
+  // This runs async/yielded to avoid UI stalls but guarantees parity.
+  return buildAiLayoutAsync().then((result) =>
+    result
+      ? { ...result, profile: { ...(result.profile || {}), source: "main-thread" } }
+      : result
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -3078,21 +3044,26 @@ function evaluateSpecialCandidate(
 
 function simulateRunnerTime(grid, special, neutralSpecials = []) {
   if (!grid) return null;
+  // Run a headless, full-fidelity race simulation (no rendering) to get exact completion time.
+  const simGrid = cloneGrid(grid);
+  ensureOpenings(simGrid);
   const runner = createRunner(
     "AI",
-    cloneGrid(grid),
+    simGrid,
     special ? cloneSpecial(special) : null,
     cloneNeutralSpecials(neutralSpecials)
   );
   if (!runner.path.length) return null;
-  const maxTime = 600;
-  let elapsed = 0;
-  while (!runner.finished && elapsed < maxTime) {
-    advanceRunnerSimulation(runner, FIXED_TIMESTEP);
-    elapsed += FIXED_TIMESTEP;
+  const dt = FIXED_TIMESTEP;
+  const maxTime = 600; // hard cap to avoid infinite loops
+  const maxSteps = Math.ceil(maxTime / dt) + 100; // guard for pathological cases
+  let steps = 0;
+  while (!runner.finished && steps < maxSteps) {
+    advanceRunnerSimulation(runner, dt);
+    steps++;
   }
   if (!runner.finished) return null;
-  return runner.resultTime ?? runner.elapsedTime ?? elapsed;
+  return runner.resultTime ?? runner.elapsedTime ?? steps * dt;
 }
 
 function advanceRunnerSimulation(runner, delta) {
@@ -3550,6 +3521,7 @@ function previewGridMetrics(gridArray, specialSpec = null, neutralSpecials = nul
   const pathInfo = analyzePath(grid);
   const score = evaluateGridForAi(grid, special, neutrals, pathInfo);
   const prediction = estimatePredictedRunTime(grid, pathInfo, special, neutrals);
+  const simulatedTime = simulateRunnerTime(grid, special, neutrals);
   return {
     score,
     predictedTime: prediction.time || 0,
@@ -3560,7 +3532,8 @@ function previewGridMetrics(gridArray, specialSpec = null, neutralSpecials = nul
     specialNeutral: prediction.components?.specialNeutralTime || 0,
     lightningPenalty: prediction.lightningPenalty || 0,
     pathDistance: pathInfo?.totalDistance || 0,
-    special: special ? `${special.type}@(${special.cell.x + 1},${special.cell.y + 1})` : "none"
+    special: special ? `${special.type}@(${special.cell.x + 1},${special.cell.y + 1})` : "none",
+    simulatedTime
   };
 }
 

@@ -324,6 +324,22 @@ function canPlaceSingle(grid, gx, gy) {
   return true;
 }
 
+function isCellAvailableForSpecial(grid, gx, gy) {
+  if (!isInsideGrid(gx, gy)) return false;
+  if ((gy === 0 || gy === GRID_SIZE - 1) && gx === ENTRANCE_X) return false;
+  const value = grid[gy][gx];
+  if (
+    value === CELL_STATIC ||
+    value === CELL_STATIC_SPECIAL ||
+    value === CELL_PLAYER ||
+    value === CELL_SPECIAL ||
+    value === CELL_SINGLE
+  ) {
+    return false;
+  }
+  return !isPadCell(value);
+}
+
 function generateRandomCandidates(rng, count) {
   const results = [];
   for (let i = 0; i < count; i++) {
@@ -424,11 +440,19 @@ function computeSpecialHotspots(grid) {
 function placeAiSpecial(grid, special) {
   if (special.placed) return;
   const hotspots = computeSpecialHotspots(grid);
-  const spot = hotspots[0] || { x: ENTRANCE_X, y: Math.max(1, Math.floor(GRID_SIZE / 2)) };
-  if (grid[spot.y][spot.x] === CELL_EMPTY) {
+  const fallback = { x: ENTRANCE_X, y: Math.max(1, Math.floor(GRID_SIZE / 2)) };
+  const candidates = hotspots.concat(fallback);
+  for (const spot of candidates) {
+    if (!isCellAvailableForSpecial(grid, spot.x, spot.y)) continue;
+    const prev = grid[spot.y][spot.x];
     grid[spot.y][spot.x] = CELL_SPECIAL;
-    special.cell = { x: spot.x, y: spot.y };
-    special.placed = true;
+    const keepsPath = hasPath(grid);
+    if (keepsPath) {
+      special.cell = { x: spot.x, y: spot.y };
+      special.placed = true;
+      return;
+    }
+    grid[spot.y][spot.x] = prev;
   }
 }
 
