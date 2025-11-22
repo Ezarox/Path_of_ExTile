@@ -379,6 +379,7 @@ const state = {
   aiSingles: [],
   aiPlacementOrder: [],
   aiProfile: null,
+  aiProfileSource: null,
   aiBuildPromise: null,
   aiJobId: 0,
   hoverCell: null,
@@ -422,6 +423,7 @@ let cataloguePrevPaused = false;
 
 seedInput.value = Math.floor(Math.random() * 1e9).toString();
 setupListeners();
+prewarmAiWorker();
 showMainMenu();
 let lastFrame = performance.now();
 let accumulator = 0;
@@ -431,9 +433,7 @@ function setupListeners() {
   newGameBtn.addEventListener("click", () => startGame(seedInput.value.trim()));
   randomSeedBtn.addEventListener("click", () => {
     seedInput.value = Math.floor(Math.random() * 1e9).toString();
-    showLoadingOverlay("Loading new seed...");
     startGame(seedInput.value);
-    setTimeout(hideLoadingOverlay, 500);
   });
   setSeedBtn.addEventListener("click", () => {
     let value = seedInput.value.trim();
@@ -511,9 +511,6 @@ function setupListeners() {
 function startGame(seedText) {
   applyVsVisibility(state.vs.active);
   cancelAiBuild();
-  let overlayStart = null;
-  let overlayPlanned = false;
-  let overlayHideFn = () => {};
   const safeSeed = seedText || Date.now().toString();
   state.seed = safeSeed;
   seedInput.value = safeSeed;
@@ -565,16 +562,11 @@ function startGame(seedText) {
   // Kick off AI generation in the background (async, non-blocking) unless in VS mode.
   if (!state.vs.active) {
     const buildToken = ++aiBuildToken;
-    overlayStart = performance.now();
-    overlayPlanned = true;
-    showLoadingOverlay("Loading new seed...");
-    overlayHideFn = () => {
-      const elapsed = performance.now() - overlayStart;
-      const delay = Math.max(0, 500 - elapsed);
-      setTimeout(hideLoadingOverlay, delay);
-    };
     state.aiBuildPromise = buildAiLayoutViaWorker()
-      .catch(() => buildAiLayoutAsync())
+      .catch((err) => {
+        console.warn("AI worker failed; falling back to main thread", err);
+        return buildAiLayoutAsync();
+      })
       .then((aiLayout) => {
         if (buildToken !== aiBuildToken) return null;
         if (!aiLayout) return null;
@@ -587,7 +579,6 @@ function startGame(seedText) {
       })
       .finally(() => {
         if (buildToken !== aiBuildToken) return;
-        if (overlayPlanned) overlayHideFn();
       });
   } else {
     state.aiBuildPromise = null;
@@ -809,6 +800,7 @@ function startFromMenu() {
     clearCurrentGameState();
     applyVsVisibility(false);
     startGame(seedInput.value);
+    hideLoadingOverlay();
     hideMainMenu();
   });
 }
@@ -1183,6 +1175,7 @@ async function startRace(forceStart = false) {
             state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
             state.aiPlacementOrder = aiLayout.placementOrder || [];
             state.aiProfile = aiLayout.profile || null;
+            state.aiProfileSource = aiLayout.profile?.source || "unknown";
           }
         } catch (err) {
           console.error("AI build failed, falling back to sync build", err);
@@ -1195,6 +1188,7 @@ async function startRace(forceStart = false) {
         state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
         state.aiPlacementOrder = aiLayout.placementOrder || [];
         state.aiProfile = aiLayout.profile || null;
+        state.aiProfileSource = aiLayout.profile?.source || "sync-fallback";
       }
     }
   }
@@ -1318,9 +1312,12 @@ function buildAiLayout() {
     specialMs: +(tSpecialEnd - tSpecialStart).toFixed(2),
     reclaimMs: +(tReclaimEnd - tReclaimStart).toFixed(2),
     lookaheadUsed: lookaheadState.used || 0,
-    placements: placementOrder.length
+    placements: placementOrder.length,
+    worker: false,
+    source: "main-thread"
   };
   state.aiProfile = profile;
+  state.aiProfileSource = profile.source;
   return { grid, special, lookaheadUsed: lookaheadState.used || 0, placementOrder, profile };
 }
 
@@ -1403,6 +1400,7 @@ function clearCurrentGameState() {
   state.aiGrid = createEmptyGrid();
   state.aiPlacementOrder = [];
   state.aiProfile = null;
+  state.aiProfileSource = null;
   state.aiBuildPromise = null;
   state.aiLookaheadUsed = 0;
   state.aiJobId = 0;
@@ -1558,9 +1556,12 @@ async function buildAiLayoutAsync() {
     specialMs: +(tSpecialEnd - tSpecialStart).toFixed(2),
     reclaimMs: +(tReclaimEnd - tReclaimStart).toFixed(2),
     lookaheadUsed: lookaheadState.used || 0,
-    placements: placementOrder.length
+    placements: placementOrder.length,
+    worker: false,
+    source: "main-thread"
   };
   state.aiProfile = profile;
+  state.aiProfileSource = profile.source;
   return { grid, special, lookaheadUsed: lookaheadState.used || 0, placementOrder, profile };
 }
 
@@ -1577,15 +1578,23 @@ function ensureAiWorker() {
   }
 }
 
+function prewarmAiWorker() {
+  const spawn = () => {
+    if (aiWorker) return;
+    try {
+      ensureAiWorker();
+    } catch (_) {}
+  };
+  if (typeof requestIdleCallback === "function") {
+    requestIdleCallback(spawn, { timeout: 500 });
+  } else {
+    setTimeout(spawn, 0);
+  }
+}
+
 function cancelAiBuild() {
   aiBuildToken++;
   state.aiBuildPromise = null;
-  if (aiWorker) {
-    try {
-      aiWorker.terminate();
-    } catch (_) {}
-  }
-  aiWorker = null;
 }
 
 function buildAiLayoutViaWorker() {
@@ -1614,7 +1623,7 @@ function buildAiLayoutViaWorker() {
           grid: data.grid,
           special: data.special,
           placementOrder: data.placementOrder,
-          profile: data.profile,
+          profile: { ...(data.profile || {}), source: "worker" },
           lookaheadUsed: data.lookaheadUsed
         });
       } else {
@@ -1790,24 +1799,14 @@ function findTopAiWallCandidates(grid, special, neutralSpecials, limit = 1) {
   if (!basePath.length) return results;
   const candidateKeys = new Set();
   function addTarget(x, y) {
-    candidateKeys.add(key(x, y));
+    if (isInsideGrid(x, y)) candidateKeys.add(key(x, y));
   }
-  // Around current path
+  // Along current path and neighbors (Chebyshev radius 2, diagonals included)
   basePath.forEach((node) => {
-    for (let dx = -2; dx <= 0; dx++) {
-      for (let dy = -2; dy <= 0; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
         addTarget(node.x + dx, node.y + dy);
       }
-    }
-    for (const [ox, oy] of [
-      [1, -2],
-      [2, -2],
-      [1, -1],
-      [2, -1],
-      [1, 0],
-      [2, 0]
-    ]) {
-      addTarget(node.x + ox, node.y + oy);
     }
   });
   // Around already placed blocks (walls or singles)

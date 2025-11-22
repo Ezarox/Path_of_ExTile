@@ -305,6 +305,17 @@ function clearBlock(grid, gx, gy) {
   grid[gy + 1][gx + 1] = CELL_EMPTY;
 }
 
+function clearBlockingAt(grid, x, y) {
+  const val = grid[y]?.[x];
+  if (val === CELL_PLAYER) {
+    const anchorX = grid[y][x - 1] === CELL_PLAYER ? x - 1 : x;
+    const anchorY = grid[y - 1]?.[x] === CELL_PLAYER ? y - 1 : y;
+    clearBlock(grid, anchorX, anchorY);
+  } else if (val === CELL_SINGLE) {
+    grid[y][x] = CELL_EMPTY;
+  }
+}
+
 function canPlaceSingle(grid, gx, gy) {
   if (!isInsideGrid(gx, gy)) return false;
   const v = grid[gy][gx];
@@ -502,7 +513,7 @@ self.onmessage = function (evt) {
       grid: layout.grid,
       special: layout.special,
       placementOrder: layout.placementOrder,
-      profile: layout.profile,
+      profile: { ...(layout.profile || {}), worker: true },
       lookaheadUsed: layout.lookaheadUsed
     });
   } catch (err) {
