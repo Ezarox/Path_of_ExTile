@@ -3063,7 +3063,7 @@ function recordResult(runner, time) {
 function decideWinner() {
   const player = state.results.player;
   const ai = state.results.ai;
-  const oppLabel = state.vs.active ? "Foe" : "AI";
+  const oppLabel = state.vs.active ? state.vs.oppLabel || "Foe" : "AI";
   if (player == null && ai == null) {
     state.results.winner = "No valid runs";
   } else if (player == null) {
@@ -4101,9 +4101,10 @@ function showResultPopup() {
   } else {
     detail = winner;
   }
+  const oppLabel = state.vs.active ? state.vs.oppLabel || "Foe" : "AI";
   const html = `${detail}<br><span class="popup-detail">You: ${
     player == null ? "DNF" : player.toFixed(2)
-  }s &nbsp;|&nbsp; AI: ${ai == null ? "DNF" : ai.toFixed(2)}s</span>`;
+  }s &nbsp;|&nbsp; ${oppLabel}: ${ai == null ? "DNF" : ai.toFixed(2)}s</span>`;
   showPopupContent({ mode: "result", emoji, message: html });
 }
 
