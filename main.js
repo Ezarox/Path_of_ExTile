@@ -593,6 +593,7 @@ function setupListeners() {
 
 function startGame(seedText) {
   applyVsVisibility(state.vs.active);
+  resetVsEarlyStartVotes();
   const safeSeed = seedText?.trim() || generateSeedString();
   const previousSeed = state.seed;
   const sameSeed = safeSeed === previousSeed;
@@ -887,6 +888,7 @@ function editAndRetry() {
   state.neutralSpecials = state.baseNeutralSpecials.map(cloneSpecial);
   updatePhaseLabel("Phase: Build");
   hidePopup();
+  resetVsEarlyStartVotes();
   updateHud();
 }
 
@@ -1543,6 +1545,7 @@ function resetVsEarlyStartVotes() {
 }
 
 function setVsChoice(choice) {
+  resetVsEarlyStartVotes();
   state.vs.choiceSelf = choice;
   vsSendRematch(choice);
   updateVsChoiceStatus();
@@ -3178,6 +3181,7 @@ function decideWinner() {
   } else {
     state.results.winner = "Tie!";
   }
+  resetVsEarlyStartVotes();
   showResultPopup();
 }
 
