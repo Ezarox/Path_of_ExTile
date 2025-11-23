@@ -3463,7 +3463,7 @@ function updateCurrencySelection(forceDisabled = false) {
 }
 
 function getOpponentLabel() {
-  return state.vs.oppLabel || (state.vs.active ? "Foe" : "AI");
+  return state.vs.active ? state.vs.oppLabel || "Foe" : "AI";
 }
 
 function formatScoreText() {
