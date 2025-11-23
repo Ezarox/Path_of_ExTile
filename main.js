@@ -386,6 +386,9 @@ const vsStatusEl = document.getElementById("vsStatus");
 const vsTryAgainBtn = document.getElementById("vsTryAgain");
 const vsNewGameBtn = document.getElementById("vsNewGame");
 const vsChoiceStatus = document.getElementById("vsChoiceStatus");
+let vsEarlyStartContainer = null;
+let vsEarlyStartBtn = null;
+let vsEarlyStartStatus = null;
 const seedControls = [
   document.querySelector(".seed-field"),
   document.getElementById("setSeed"),
@@ -394,6 +397,29 @@ const seedControls = [
   document.getElementById("editRetry")
 ];
 const vsUiControls = [vsToggleBtn, vsPanel];
+
+if (vsPanel) {
+  vsEarlyStartContainer = document.createElement("div");
+  vsEarlyStartContainer.className = "vs-early-start";
+  vsEarlyStartContainer.style.display = "none";
+  vsEarlyStartContainer.style.marginTop = "0.35rem";
+  vsEarlyStartContainer.style.flexDirection = "row";
+  vsEarlyStartContainer.style.gap = "0.65rem";
+  vsEarlyStartContainer.style.alignItems = "center";
+  vsEarlyStartContainer.style.fontSize = "0.85rem";
+  vsEarlyStartBtn = document.createElement("button");
+  vsEarlyStartBtn.type = "button";
+  vsEarlyStartBtn.textContent = "Suggest Early Start";
+  vsEarlyStartBtn.style.padding = "0.25rem 0.5rem";
+  vsEarlyStartBtn.style.fontSize = "0.8rem";
+  vsEarlyStartStatus = document.createElement("span");
+  vsEarlyStartStatus.style.fontSize = "0.75rem";
+  vsEarlyStartStatus.style.opacity = "0.85";
+  vsEarlyStartContainer.appendChild(vsEarlyStartBtn);
+  vsEarlyStartContainer.appendChild(vsEarlyStartStatus);
+  vsPanel.appendChild(vsEarlyStartContainer);
+  vsEarlyStartBtn.addEventListener("click", () => toggleEarlyStartVote());
+}
 function clearCanvas() {
   ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 }
@@ -454,7 +480,10 @@ const state = {
     choiceSelf: null,
     choicePeer: null,
     lastSeed: "",
-    rematchMode: null
+    rematchMode: null,
+    earlyStartSelf: false,
+    earlyStartPeer: false,
+    earlyStartTriggered: false
   }
 };
 let padPulseTimer = 0;
@@ -539,6 +568,16 @@ function setupListeners() {
   vsReadyBtn?.addEventListener("click", () => sendVsReady());
   vsTryAgainBtn?.addEventListener("click", () => setVsChoice("same"));
   vsNewGameBtn?.addEventListener("click", () => setVsChoice("new"));
+  if (vsTryAgainBtn) {
+    vsTryAgainBtn.textContent = "Modify Current Maze";
+    vsTryAgainBtn.style.padding = "0.25rem 0.5rem";
+    vsTryAgainBtn.style.fontSize = "0.8rem";
+  }
+  if (vsNewGameBtn) {
+    vsNewGameBtn.textContent = "New Seed";
+    vsNewGameBtn.style.padding = "0.25rem 0.5rem";
+    vsNewGameBtn.style.fontSize = "0.8rem";
+  }
   document.addEventListener("keydown", (evt) => {
     if (evt.key === "Escape" && state.catalogueOpen) {
       closeCatalogue();
@@ -653,9 +692,11 @@ function toggleVsPanel() {
     vsPanel.classList.remove("hidden");
     state.vs.active = true;
     connectVs();
+    updateEarlyStartControls();
   } else {
     vsPanel.classList.add("hidden");
     state.vs.active = false;
+    updateEarlyStartControls();
   }
 }
 
@@ -663,6 +704,7 @@ function connectVs(mode, roomCode = "") {
   vsConnect(handleVsEvent);
   state.vs.active = true;
   vsPanel?.classList.remove("hidden");
+  resetVsEarlyStartVotes();
   if (mode === "create") {
     vsCreateRoom();
   } else if (mode === "join" && roomCode) {
@@ -681,11 +723,13 @@ function handleVsEvent(evt) {
     state.vs.connected = true;
     updateVsStatus("Connected. Create or join a room.");
     setVsWaitingTimer();
+    resetVsEarlyStartVotes();
     return;
   }
   if (evt.type === "disconnected") {
     state.vs.connected = false;
     updateVsStatus("Disconnected.");
+    resetVsEarlyStartVotes();
     return;
   }
   if (evt.type === "created") {
@@ -721,6 +765,7 @@ function handleVsEvent(evt) {
     alert("Peer disconnected from the lobby.");
     state.vs.waitingForStart = true;
     state.vs.opponentMaze = null;
+    resetVsEarlyStartVotes();
     return;
   }
   if (evt.type === "ready") {
@@ -755,6 +800,12 @@ function handleVsEvent(evt) {
     state.vs.opponentMaze = evt.payload;
     updateVsStatus("Opponent maze received.");
     maybeStartVsRace();
+    return;
+  }
+  if (evt.type === "early-start") {
+    state.vs.earlyStartPeer = !!evt.vote;
+    updateEarlyStartControls();
+    maybeTriggerEarlyStart();
     return;
   }
   if (evt.type === "rematch") {
@@ -1334,6 +1385,7 @@ function setVsUiVisible(show) {
     if (show) el.classList.remove("hidden");
     else el.classList.add("hidden");
   });
+  updateEarlyStartControls();
 }
 
 function applyVsVisibility(active) {
@@ -1441,6 +1493,55 @@ function checkVsChoiceReady() {
   sendVsReady();
 }
 
+function toggleEarlyStartVote() {
+  if (!state.vs.active || state.vs.earlyStartTriggered) return;
+  const request = !state.vs.earlyStartSelf;
+  state.vs.earlyStartSelf = request;
+  sendEarlyStartVote(request);
+  updateEarlyStartControls();
+  maybeTriggerEarlyStart();
+}
+
+function sendEarlyStartVote(vote) {
+  if (!state.vs.room) return;
+  vsSend({ type: "early-start", room: state.vs.room, vote: !!vote });
+}
+
+function maybeTriggerEarlyStart() {
+  if (!state.vs.active) return;
+  if (state.vs.earlyStartTriggered) return;
+  if (!state.vs.earlyStartSelf || !state.vs.earlyStartPeer) return;
+  state.vs.earlyStartTriggered = true;
+  state.vs.waitingForStart = false;
+  if (state.vs.timerId) {
+    clearInterval(state.vs.timerId);
+    state.vs.timerId = null;
+  }
+  lockPlayerBuild();
+  sendVsMaze();
+  updateVsStatus("Early start agreed. Sharing mazes...");
+  updateEarlyStartControls();
+}
+
+function updateEarlyStartControls() {
+  if (!vsEarlyStartContainer || !vsEarlyStartBtn || !vsEarlyStartStatus) return;
+  const visible = state.vs.active && state.mode === "game";
+  vsEarlyStartContainer.style.display = visible ? "flex" : "none";
+  vsEarlyStartBtn.disabled = !visible || state.vs.earlyStartTriggered;
+  vsEarlyStartBtn.textContent = state.vs.earlyStartSelf ? "Withdraw Early Start" : "Suggest Early Start";
+  const selfStatus = state.vs.earlyStartSelf ? "Ready" : "-";
+  const peerLabel = state.vs.oppShort || state.vs.oppLabel || "Opponent";
+  const peerStatus = state.vs.earlyStartPeer ? "Ready" : "-";
+  vsEarlyStartStatus.textContent = `${state.vs.selfShort || "You"}: ${selfStatus} | ${peerLabel}: ${peerStatus}`;
+}
+
+function resetVsEarlyStartVotes() {
+  state.vs.earlyStartSelf = false;
+  state.vs.earlyStartPeer = false;
+  state.vs.earlyStartTriggered = false;
+  updateEarlyStartControls();
+}
+
 function setVsChoice(choice) {
   state.vs.choiceSelf = choice;
   vsSendRematch(choice);
@@ -1456,7 +1557,7 @@ function vsSendRematch(choice) {
 function updateVsChoiceStatus() {
   if (!vsChoiceStatus) return;
   const self = state.vs.choiceSelf ? `You: ${state.vs.choiceSelf}` : "You: -";
-  const peer = state.vs.choicePeer ? `Peer: ${state.vs.choicePeer}` : "Peer: -";
+  const peer = state.vs.choicePeer ? `Foe: ${state.vs.choicePeer}` : "Foe: -";
   vsChoiceStatus.textContent = `${self} | ${peer}`;
 }
 
@@ -4199,6 +4300,7 @@ function showMainMenu() {
   setSeedUiVisible(true);
   setVsUiVisible(false);
   applyVsVisibility(false);
+  resetVsEarlyStartVotes();
   cancelAiBuild({ terminateWorker: true });
   clearCurrentGameState();
 }
