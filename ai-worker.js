@@ -20,7 +20,9 @@ self.onmessage = function (evt) {
       special: layout.special,
       placementOrder: layout.placementOrder,
       profile: { ...(layout.profile || {}), worker: true },
-      lookaheadUsed: layout.lookaheadUsed
+      branchId: layout.branchId,
+      branchTotal: layout.branchTotal,
+      branch: layout.branch ?? null
     });
   } catch (err) {
     self.postMessage({ jobId, ok: false, error: err?.message || String(err) });

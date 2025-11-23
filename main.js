@@ -374,6 +374,7 @@ const popupMessageEl = document.getElementById("popupMessage");
 const popupEmojiEl = document.getElementById("popupEmoji");
 const popupCloseBtn = document.getElementById("closePopup");
 const shareResultBtn = document.getElementById("shareResult");
+let currentPopupMode = null;
 const menuVsBtn = document.getElementById("menuVs");
 const vsToggleBtn = document.getElementById("vsToggle");
 const vsPanel = document.getElementById("vsPanel");
@@ -419,6 +420,7 @@ const state = {
   aiProfileSource: null,
   aiBuildPromise: null,
   aiJobId: 0,
+  aiPendingSeed: "",
   hoverCell: null,
   floatingTexts: [],
   buildMode: "normal",
@@ -505,7 +507,7 @@ function setupListeners() {
   canvas.addEventListener("touchcancel", handleTouchEnd);
   canvas.addEventListener("mousemove", handleMouseMove);
   canvas.addEventListener("mouseleave", () => (state.hoverCell = null));
-  popupCloseBtn.addEventListener("click", hideResultPopup);
+  popupCloseBtn.addEventListener("click", hidePopup);
   menuSingleBtn.addEventListener("click", () => startFromMenu());
   menuVsBtn?.addEventListener("click", startVsFromMenu);
   menuQuitBtn.addEventListener("click", () => {
@@ -530,6 +532,7 @@ function setupListeners() {
     if (evt.target === catalogueOverlay) closeCatalogue();
   });
   shareResultBtn?.addEventListener("click", handleShareResult);
+  setShareButtonVisible(false);
   vsToggleBtn?.addEventListener("click", toggleVsPanel);
   vsCreateBtn?.addEventListener("click", () => connectVs("create"));
   vsJoinBtn?.addEventListener("click", () => connectVs("join", vsRoomInput?.value?.trim()));
@@ -551,8 +554,12 @@ function setupListeners() {
 
 function startGame(seedText) {
   applyVsVisibility(state.vs.active);
-  cancelAiBuild();
   const safeSeed = seedText?.trim() || generateSeedString();
+  const previousSeed = state.seed;
+  const sameSeed = safeSeed === previousSeed;
+  if (!sameSeed) {
+    cancelAiBuild({ terminateWorker: true });
+  }
   state.seed = safeSeed;
   seedInput.value = safeSeed;
   state.rng = mulberry32(hashSeed(safeSeed));
@@ -564,11 +571,18 @@ function startGame(seedText) {
   state.baseNeutralSpecials = baseGeneration.neutralSpecial ? [baseGeneration.neutralSpecial] : [];
   state.neutralSpecials = state.baseNeutralSpecials.map(cloneSpecial);
   state.playerGrid = cloneGrid(state.baseGrid);
-  state.aiGrid = null;
+  if (!sameSeed) {
+    state.aiGrid = null;
+    state.aiSpecial = null;
+    state.aiBuildPromise = null;
+    state.aiJobId = 0;
+    state.aiProfile = null;
+    state.aiProfileSource = null;
+    state.aiLookaheadUsed = 0;
+    state.aiPlacementOrder = [];
+  }
   state.aiWalls = [];
   state.aiSingles = [];
-  state.aiBuildPromise = null;
-  state.aiJobId = 0;
   state.vs.opponentMaze = null;
   state.vs.startsAt = null;
   state.coins = randomInt(state.rng, 10, 21);
@@ -581,7 +595,6 @@ function startGame(seedText) {
   const specialType = pickSpecialType(state.rng);
   state.specialTemplate = createSpecialTemplate(specialType);
   state.playerSpecial = createSpecialTemplate(specialType);
-  state.aiSpecial = null;
   state.building = true;
   state.buildMode = "normal";
   state.buildTimeLeft = BUILD_DURATION / 1000;
@@ -593,7 +606,7 @@ function startGame(seedText) {
   setBuildMode("normal");
   updateSpecialInfo();
   updatePhaseLabel("Phase: Build");
-  hideResultPopup();
+  hidePopup();
   state.mode = "game";
   state.paused = false;
   hud.classList.remove("hidden");
@@ -602,25 +615,32 @@ function startGame(seedText) {
   setVsUiVisible(state.vs.active);
   // Kick off AI generation in the background (async, non-blocking) unless in VS mode.
   if (!state.vs.active) {
-    const buildToken = ++aiBuildToken;
-    state.aiBuildPromise = buildAiLayoutViaWorker()
-      .catch((err) => {
-        console.warn("AI worker failed; falling back to main thread", err);
-        return buildAiLayoutAsync();
-      })
-      .then((aiLayout) => {
-        if (buildToken !== aiBuildToken) return null;
-        if (!aiLayout) return null;
-        state.aiGrid = aiLayout.grid;
-        state.aiSpecial = aiLayout.special;
-        state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
-        state.aiPlacementOrder = aiLayout.placementOrder || [];
-        state.aiProfile = aiLayout.profile || null;
-        return aiLayout;
-      })
-      .finally(() => {
-        if (buildToken !== aiBuildToken) return;
-      });
+    if (!sameSeed) {
+      state.aiPendingSeed = safeSeed;
+      const buildToken = ++aiBuildToken;
+      state.aiBuildPromise = buildAiLayoutViaWorker()
+        .catch((err) => {
+          console.warn("AI worker failed; falling back to main thread", err);
+          return buildAiLayoutAsync();
+        })
+        .then((aiLayout) => {
+          if (buildToken !== aiBuildToken) return null;
+          if (!aiLayout) return null;
+          state.aiGrid = aiLayout.grid;
+          state.aiSpecial = aiLayout.special;
+          state.aiLookaheadUsed = aiLayout.lookaheadUsed || 0;
+          state.aiPlacementOrder = aiLayout.placementOrder || [];
+          state.aiProfile = aiLayout.profile || null;
+          return {
+            ...aiLayout,
+            branchId: aiLayout.branchId ?? aiLayout.branch,
+            branchTotal: aiLayout.branchTotal ?? null
+          };
+        })
+        .finally(() => {
+          if (buildToken !== aiBuildToken) return;
+        });
+    }
   } else {
     state.aiBuildPromise = null;
     state.aiGrid = null;
@@ -815,7 +835,7 @@ function editAndRetry() {
   if (state.aiSpecial) state.aiSpecial.effectTimer = 0;
   state.neutralSpecials = state.baseNeutralSpecials.map(cloneSpecial);
   updatePhaseLabel("Phase: Build");
-  hideResultPopup();
+  hidePopup();
   updateHud();
 }
 
@@ -1208,6 +1228,7 @@ async function startRace(forceStart = false) {
       state.aiBuildPromise = Promise.resolve();
     } else {
       if (state.aiBuildPromise) {
+        showAiBuildPopup();
         try {
           const aiLayout = await state.aiBuildPromise;
           if (aiLayout) {
@@ -1220,6 +1241,8 @@ async function startRace(forceStart = false) {
           }
         } catch (err) {
           console.error("AI build failed, falling back to sync build", err);
+        } finally {
+          hideAiBuildPopup();
         }
       }
       if (!state.aiGrid || !state.aiSpecial) {
@@ -1283,14 +1306,19 @@ function buildAiLayout() {
   const result = AICore.buildAiLayoutFromSnapshot(makeAiSnapshot());
   state.aiProfile = result.profile || null;
   state.aiProfileSource = result.profile?.source || "ai-core";
+  const branch = normalizeBranch(result);
   return {
     grid: result.grid,
     special: result.special,
     lookaheadUsed: result.lookaheadUsed || 0,
     placementOrder: result.placementOrder || [],
-    profile: result.profile || null
+    profile: result.profile || null,
+    branch,
+    branchId: result.branchId || null,
+    branchTotal: result.branchTotal || null
   };
 }
+
 
 function setSeedUiVisible(show) {
   seedControls.forEach((el) => {
@@ -1375,6 +1403,7 @@ function clearCurrentGameState() {
   state.aiBuildPromise = null;
   state.aiLookaheadUsed = 0;
   state.aiJobId = 0;
+  state.aiPendingSeed = "";
   state.aiWalls = [];
   state.aiSingles = [];
   state.results = { player: null, ai: null, winner: null };
@@ -1479,8 +1508,14 @@ function ensureAiWorker() {
   }
 }
 
-function cancelAiBuild() {
+function cancelAiBuild(options = {}) {
+  const { terminateWorker = false } = options;
   aiBuildToken++;
+  if (terminateWorker) {
+    terminateAiWorker();
+    hideAiBuildPopup();
+    state.aiPendingSeed = "";
+  }
   state.aiBuildPromise = null;
 }
 
@@ -1519,6 +1554,17 @@ function buildAiLayoutViaWorker() {
     worker.addEventListener("error", handleError);
     worker.postMessage({ jobId, snapshot });
   });
+}
+
+function terminateAiWorker() {
+  if (!aiWorker) return;
+  try {
+    aiWorker.terminate();
+  } catch (err) {
+    console.warn("AI worker termination failed", err);
+  }
+  aiWorker = null;
+  aiWorkerJobCounter = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,12 +2574,18 @@ function evaluateSeedBatch(seedList, runs = 1) {
     const simulatedAvg =
       results.reduce((sum, entry) => sum + (entry.simulatedTime || 0), 0) / results.length;
     const bestSimulated = Math.max(...results.map((entry) => entry.simulatedTime || 0));
+      const bestResult = results.reduce((prev, entry) => {
+        const prevSim = prev?.simulatedTime || 0;
+        const entrySim = entry?.simulatedTime || 0;
+      return entrySim > prevSim ? entry : prev;
+    }, results[0] || {});
     return {
       seed,
       runs: results.length,
       predictedAvg: Number(predictedAvg.toFixed(2)),
       simulatedAvg: Number(simulatedAvg.toFixed(2)),
-      bestSimulated: Number(bestSimulated.toFixed(2))
+      bestSimulated: Number(bestSimulated.toFixed(2)),
+      branch: bestResult?.branch ?? null
     };
   });
   if (typeof console !== "undefined" && console.table) {
@@ -2734,6 +2786,21 @@ function sampleWeight(base, range = 0.25) {
   return Math.max(0, base * (1 + delta));
 }
 
+function mapBranchIndex(branchId, branchTotal) {
+  if (branchId == null || branchTotal == null) return null;
+  if (branchId <= 3) return branchId;
+  if (branchTotal - branchId === 2) return -3;
+  if (branchTotal - branchId === 1) return -2;
+  if (branchTotal - branchId === 0) return -1;
+  return null;
+}
+
+function normalizeBranch(layout) {
+  if (!layout) return null;
+  if (layout.branchPlacementIndex != null) return layout.branchPlacementIndex;
+  return mapBranchIndex(layout.branchId, layout.branchTotal);
+}
+
 function summarizeAiMetrics(seed, layout, pathInfo) {
   if (!pathInfo) {
     return {
@@ -2773,10 +2840,11 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
   const specialInfo = layout.special?.cell
     ? `${layout.special.type}@(${layout.special.cell.x + 1},${layout.special.cell.y + 1})`
     : "none";
+  const branchValue = normalizeBranch(layout);
   return {
     seed,
     gridString: JSON.stringify(layout.grid),
-    distance: Number(pathInfo.totalDistance.toFixed(2)),
+    distance: Number(pathInfo.totalDistance.toFixed(0)),
     predictedTime: Number(prediction.time.toFixed(2)),
     simulatedTime: simulated != null ? Number(simulated.toFixed(2)) : null,
     mandatorySpeeds,
@@ -2785,7 +2853,9 @@ function summarizeAiMetrics(seed, layout, pathInfo) {
     slowStack: Number((components.slowStackTime || 0).toFixed(2)),
     blockUsage: Number(blockUsage.toFixed(3)),
     special: specialInfo,
-    lookaheadUsed: layout.lookaheadUsed || 0
+    branch: branchValue,
+    branchId: layout.branchId || null,
+    branchTotal: layout.branchTotal || null
   };
 }
 
@@ -4001,6 +4071,23 @@ function updatePhaseLabel(text) {
   if (phaseEl) phaseEl.textContent = text;
 }
 
+function showPopupContent({ mode, emoji, message }) {
+  currentPopupMode = mode;
+  popupEmojiEl.textContent = emoji;
+  popupMessageEl.innerHTML = message;
+  resultPopup.classList.remove("hidden");
+  document.addEventListener("mousedown", handlePopupBackdrop, true);
+  setShareButtonVisible(mode === "result");
+}
+
+function hidePopup() {
+  if (!currentPopupMode) return;
+  resultPopup.classList.add("hidden");
+  document.removeEventListener("mousedown", handlePopupBackdrop, true);
+  currentPopupMode = null;
+  setShareButtonVisible(false);
+}
+
 function showResultPopup() {
   if (!state.results.winner) return;
   const { player, ai, winner } = state.results;
@@ -4014,47 +4101,40 @@ function showResultPopup() {
   } else {
     detail = winner;
   }
-  popupEmojiEl.textContent = emoji;
-  popupMessageEl.innerHTML = `${detail}<br><span class="popup-detail">You: ${player == null ? "DNF" : player.toFixed(
-    2
-  )}s &nbsp;|&nbsp; AI: ${ai == null ? "DNF" : ai.toFixed(2)}s</span>`;
-  resultPopup.classList.remove("hidden");
-  document.addEventListener("mousedown", handlePopupBackdrop, true);
+  const html = `${detail}<br><span class="popup-detail">You: ${
+    player == null ? "DNF" : player.toFixed(2)
+  }s &nbsp;|&nbsp; AI: ${ai == null ? "DNF" : ai.toFixed(2)}s</span>`;
+  showPopupContent({ mode: "result", emoji, message: html });
 }
 
 function hideResultPopup() {
-  resultPopup.classList.add("hidden");
-  document.removeEventListener("mousedown", handlePopupBackdrop, true);
+  if (currentPopupMode === "result") {
+    hidePopup();
+  }
+}
+
+function showAiBuildPopup() {
+  if (currentPopupMode) return;
+  const html = `AI is still generating their maze for this seed... Please wait.<br><span class="popup-detail">You can close this message while the worker finishes building; you can still edit or restart in the meantime.</span>`;
+  showPopupContent({ mode: "aiBuild", emoji: "⌛", message: html });
+}
+
+function hideAiBuildPopup() {
+  if (currentPopupMode === "aiBuild") {
+    hidePopup();
+  }
+}
+
+function setShareButtonVisible(visible) {
+  if (!shareResultBtn) return;
+  shareResultBtn.style.display = visible ? "" : "none";
 }
 
 function handlePopupBackdrop(evt) {
   if (!resultCard) return;
   if (!resultCard.contains(evt.target)) {
-    hideResultPopup();
+    hidePopup();
   }
-}
-
-// Override result popup to use Foe labeling in VS mode
-function showResultPopup() {
-  if (!state.results.winner) return;
-  const { player, ai, winner } = state.results;
-  const oppLabel = state.vs.active ? "Foe" : "AI";
-  let emoji = "🙂";
-  if (winner.includes("You")) emoji = "😄";
-  else if (winner.includes("AI") || winner.includes("Foe")) emoji = "😞";
-  let detail = "";
-  if (player != null && ai != null) {
-    const diff = Math.abs(player - ai).toFixed(2);
-    detail = `${winner} by ${diff}s`;
-  } else {
-    detail = winner;
-  }
-  popupEmojiEl.textContent = emoji;
-  popupMessageEl.innerHTML = `${detail}<br><span class="popup-detail">You: ${
-    player == null ? "DNF" : player.toFixed(2)
-  }s &nbsp;|&nbsp; ${oppLabel}: ${ai == null ? "DNF" : ai.toFixed(2)}s</span>`;
-  resultPopup.classList.remove("hidden");
-  document.addEventListener("mousedown", handlePopupBackdrop, true);
 }
 
 function handleShareResult() {
@@ -4114,7 +4194,7 @@ function showMainMenu() {
   setSeedUiVisible(true);
   setVsUiVisible(false);
   applyVsVisibility(false);
-  cancelAiBuild();
+  cancelAiBuild({ terminateWorker: true });
   clearCurrentGameState();
 }
 

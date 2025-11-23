@@ -48,3 +48,15 @@ Current weights:
   lightningPadPenalty
   beamCrossings
 
+Forcing coding agent back on track:
+  You are helping me refactor a small personal game project. I use git and am happy to fix broken builds.
+
+  Hard rules for you:
+  1. It is OK to break the build.
+  2. Never say a task is "too big", "too risky", or that you "don’t have time".
+  3. Never say "I have to stop here", "I’m going to stop here", or that you’ll "continue off-screen".
+  4. When I say "proceed", you MUST output code changes, not plans.
+  5. Prefer showing full updated files or a unified diff over explanations.
+
+  If you are unsure, still attempt the change and show the result.
+  Do NOT narrate safety concerns. Just do the work.

@@ -1509,187 +1509,248 @@
   function buildAiLayoutFromSnapshot(snapshot) {
     const aiWeights = { ...AI_WEIGHT_DEFAULTS, ...(snapshot.aiWeights || {}) };
     const rng = snapshot.rng || mulberry32(snapshot.rngSeed >>> 0);
-    const grid = cloneGrid(snapshot.baseGrid);
-    const special = createSpecialTemplate(snapshot.specialTemplate?.type || "radius");
-    const neutralSpecials = snapshot.baseNeutralSpecials || [];
-    let wallsLeft = snapshot.coinBudget | 0;
-    let singlesLeft = snapshot.singleBudget | 0;
-    ensureOpenings(grid);
-    let currentScore = evaluateGridForAi(grid, special, neutralSpecials, null, aiWeights, snapshot.baseGrid);
-    const placementOrder = [];
-    let specialPlacementRecorded = false;
-    const t0 = Date.now();
-    let safety = 0;
-    while (wallsLeft > 0 || singlesLeft > 0) {
-      if (safety++ > 500) break; // hard guard against infinite loops
-      const pathInfo = analyzePath(grid);
-      if (!pathInfo) break;
-      const specialHotspots =
-        !special?.placed && snapshot?.specialHotspotsOverride
-          ? snapshot.specialHotspotsOverride
-          : !special?.placed
-          ? computeSpecialHotspots(grid, special, neutralSpecials, SPECIAL_HOTSPOT_LIMIT, rng)
-          : [];
-      const hotspotSnapshot = specialHotspots.map((spot) => ({
-        x: spot.x,
-        y: spot.y,
-        score: spot.score
-      }));
-      const comboSpecialHotspots = specialHotspots.slice(0, COMBO_POOL_LIMIT);
-      const placement = findBestAiPlacement(
-        grid,
-        currentScore,
-        special,
-        neutralSpecials,
-        pathInfo,
-        { wallsLeft, singlesLeft, specialHotspots: comboSpecialHotspots },
-        wallsLeft > 0,
-        singlesLeft > 0,
-        null,
-        aiWeights,
-        snapshot.baseGrid,
-        rng
-      );
-      let chosen = placement;
-      if (!chosen && (wallsLeft > 0 || singlesLeft > 0)) {
-        // last-ditch: try random candidates until something places without blocking the path
-        const tries = 200;
-        for (let t = 0; t < tries && !chosen; t++) {
-          const wallTry = wallsLeft > 0;
-          const singleTry = singlesLeft > 0;
-          const isWall = wallTry && (!singleTry || rng() > 0.5);
-          if (isWall) {
-            const x = Math.floor(rng() * (GRID_SIZE - 1));
-            const y = 1 + Math.floor(rng() * (GRID_SIZE - 2));
-            if (!canPlaceBlock(grid, x, y)) continue;
-            placeBlock(grid, x, y, CELL_PLAYER);
-            ensureOpenings(grid);
-            if (hasPath(grid)) {
-              const score = evaluateGridForAi(grid, special, neutralSpecials, null, aiWeights, snapshot.baseGrid);
-              chosen = { type: "wall", x, y, score };
-            }
-            if (!chosen) {
-              clearBlock(grid, x, y);
-              ensureOpenings(grid);
-            }
-          } else {
-            const x = Math.floor(rng() * GRID_SIZE);
-            const y = 1 + Math.floor(rng() * (GRID_SIZE - 2));
-            if (!canPlaceSingle(grid, x, y)) continue;
-            const prev = grid[y][x];
-            grid[y][x] = CELL_SINGLE;
-            ensureOpenings(grid);
-            if (hasPath(grid)) {
-              const score = evaluateGridForAi(grid, special, neutralSpecials, null, aiWeights, snapshot.baseGrid);
-              chosen = { type: "single", x, y, score };
-            }
-            if (!chosen) {
-              grid[y][x] = prev;
-              ensureOpenings(grid);
-            }
-          }
-        }
-      }
-      if (!chosen && (wallsLeft > 0 || singlesLeft > 0)) {
-        const brute = findFallbackAiCandidates(
-          grid,
-          special,
-          neutralSpecials,
-          wallsLeft > 0,
-          singlesLeft > 0,
-          rng || mulberry32(hashSeed("brute")),
-          aiWeights,
-          snapshot.baseGrid
-        );
-        if (brute.length) {
-          brute.sort((a, b) => b.score - a.score);
-          chosen = brute[0];
-        }
-      }
-      if (!chosen) break;
-      if (chosen.type === "wall" && wallsLeft > 0) {
-        placeBlock(grid, chosen.x, chosen.y, CELL_PLAYER);
-        ensureOpenings(grid);
-        wallsLeft--;
-        placementOrder.push({
-          type: "wall",
-          row: chosen.y + 1,
-          column: chosen.x + 1,
-          specialHotspots: hotspotSnapshot
-        });
-      } else if (chosen.type === "single" && singlesLeft > 0) {
-        grid[chosen.y][chosen.x] = CELL_SINGLE;
-        ensureOpenings(grid);
-        singlesLeft--;
-        placementOrder.push({
-          type: "single",
-          row: chosen.y + 1,
-          column: chosen.x + 1,
-          specialHotspots: hotspotSnapshot
-        });
-      } else if (chosen.type === "special" && !special?.placed) {
-        grid[chosen.y][chosen.x] = CELL_SPECIAL;
-        ensureOpenings(grid);
-        special.cell = { x: chosen.x, y: chosen.y };
-        special.placed = true;
-        special.effectTimer = 0;
-        special.cooldown = 0;
-        special.flashTimer = 0;
-        placementOrder.push({
-          type: "special",
-          row: special.cell.y + 1,
-          column: special.cell.x + 1,
-          specialHotspots: hotspotSnapshot
-        });
-        specialPlacementRecorded = true;
-      } else {
-        // Candidate type is not affordable; skip it so the loop can seek another option.
-        continue;
-      }
-      currentScore = chosen.score;
-    }
-    currentScore = reduceMandatorySpeedPads(grid, special, neutralSpecials, currentScore, aiWeights, snapshot.baseGrid);
+    const baseState = {
+      grid: cloneGrid(snapshot.baseGrid),
+      special: createSpecialTemplate(snapshot.specialTemplate?.type || "radius"),
+      neutralSpecials: snapshot.baseNeutralSpecials || [],
+      wallsLeft: snapshot.coinBudget | 0,
+      singlesLeft: snapshot.singleBudget | 0,
+      initialPlacements: (snapshot.coinBudget | 0) + (snapshot.singleBudget | 0),
+      placementsMade: 0,
+      aiWeights,
+      baseGrid: snapshot.baseGrid,
+      rng,
+      placementOrder: [],
+      specialsOverride: snapshot.specialHotspotsOverride || null,
+      branchPlacementIndex: null,
+      branchCounter: { value: 0 }
+    };
+    const layouts = branchBuild(baseState);
+    const best = layouts
+      .filter(Boolean)
+      .sort((a, b) => (b.simulatedTime ?? -Infinity) - (a.simulatedTime ?? -Infinity))[0];
+    return best || finalizeLayout(baseState);
+  }
 
-    const specialHotspots = computeSpecialHotspots(grid, special, neutralSpecials, SPECIAL_HOTSPOT_LIMIT, rng);
-    const finalHotspotSnapshot = specialHotspots.map((spot) => ({
+  function computeBranchPlacementIndex(state) {
+    if (!state) return null;
+    const placementsMade = state.placementsMade || 0;
+    if (placementsMade > 0 && placementsMade <= 3) {
+      return placementsMade;
+    }
+    const totalPlacements = state.initialPlacements || 0;
+    const placementsRemaining = Math.max(0, totalPlacements - placementsMade);
+    if (placementsRemaining >= 1 && placementsRemaining <= 3) {
+      return -placementsRemaining;
+    }
+    return null;
+  }
+
+  function branchBuild(state) {
+    if (!state) return [];
+    if (state.wallsLeft <= 0 && state.singlesLeft <= 0) {
+      return [finalizeLayout(state)];
+    }
+    const pathInfo = analyzePath(state.grid);
+    if (!pathInfo) {
+      return [finalizeLayout(state)];
+    }
+    const chosen = chooseBlockPlacement(state, pathInfo);
+    if (!chosen) {
+      return [finalizeLayout(state)];
+    }
+    const nextState = cloneState(state);
+    applyBlockPlacement(nextState, chosen);
+    const specialHotspots =
+      !nextState.special?.placed && nextState.specialsOverride
+        ? nextState.specialsOverride
+        : !nextState.special?.placed
+        ? computeSpecialHotspots(nextState.grid, nextState.special, nextState.neutralSpecials, SPECIAL_HOTSPOT_LIMIT, nextState.rng)
+        : [];
+    const hotspotSnapshot = specialHotspots.map((spot) => ({
       x: spot.x,
       y: spot.y,
       score: spot.score
     }));
-    placeAiSpecial(grid, special, neutralSpecials, specialHotspots, rng);
-    if (special?.cell && !specialPlacementRecorded) {
-      placementOrder.push({
-        type: "special",
-        row: special.cell.y + 1,
-        column: special.cell.x + 1,
-        specialHotspots: finalHotspotSnapshot
-      });
+    const lastEntry = nextState.placementOrder[nextState.placementOrder.length - 1];
+    if (lastEntry) {
+      lastEntry.specialHotspots = hotspotSnapshot;
     }
+    const branchPlacementIndex = computeBranchPlacementIndex(nextState);
+    const results = [];
+    const placementsRemaining = (nextState.initialPlacements || 0) - (nextState.placementsMade || 0);
+    const shouldBranch =
+      (!nextState.special?.placed &&
+        specialHotspots.length &&
+        ((nextState.placementsMade || 0) <= 3 || placementsRemaining <= 3));
+    if (shouldBranch) {
+      const specialState = cloneState(nextState);
+      if (branchPlacementIndex != null) {
+        specialState.branchPlacementIndex = branchPlacementIndex;
+      }
+      applySpecialBranch(specialState, specialHotspots[0], hotspotSnapshot);
+      results.push(...branchBuild(specialState));
+    }
+    results.push(...branchBuild(nextState));
+    return results;
+  }
 
-    const reclaimStats = reclaimAndReallocateBlocks(
-      grid,
-      special,
-      neutralSpecials,
-      placementOrder,
-      aiWeights,
-      snapshot.baseGrid,
-      rng
+  function chooseBlockPlacement(state, pathInfo) {
+    const placement = findBestAiPlacement(
+      state.grid,
+      evaluateGridForAi(state.grid, state.special, state.neutralSpecials),
+      state.special,
+      state.neutralSpecials,
+      pathInfo,
+      { wallsLeft: state.wallsLeft, singlesLeft: state.singlesLeft, specialHotspots: [] },
+      state.wallsLeft > 0,
+      state.singlesLeft > 0,
+      null,
+      state.aiWeights,
+      state.baseGrid,
+      state.rng
     );
-    placementOrder.reallocations = reclaimStats.reallocated || 0;
-    placementOrder.reallocationPasses = reclaimStats.passes || 0;
-    annotatePlacementImpacts(grid, special, neutralSpecials, placementOrder);
+    if (placement) return placement;
+    return fallbackPlacement(state);
+  }
 
+  function fallbackPlacement(state) {
+    const tries = 200;
+    for (let t = 0; t < tries; t++) {
+      const wallTry = state.wallsLeft > 0;
+      const singleTry = state.singlesLeft > 0;
+      if (!wallTry && !singleTry) break;
+      const isWall = wallTry && (!singleTry || state.rng() > 0.5);
+      if (isWall) {
+        const x = Math.floor(state.rng() * (GRID_SIZE - 1));
+        const y = 1 + Math.floor(state.rng() * (GRID_SIZE - 2));
+        if (!canPlaceBlock(state.grid, x, y)) continue;
+        placeBlock(state.grid, x, y, CELL_PLAYER);
+        ensureOpenings(state.grid);
+        if (hasPath(state.grid)) {
+          const score = evaluateGridForAi(state.grid, state.special, state.neutralSpecials, null, state.aiWeights, state.baseGrid);
+          clearBlock(state.grid, x, y);
+          ensureOpenings(state.grid);
+          return { type: "wall", x, y, score };
+        }
+        clearBlock(state.grid, x, y);
+        ensureOpenings(state.grid);
+      } else {
+        const x = Math.floor(state.rng() * GRID_SIZE);
+        const y = 1 + Math.floor(state.rng() * (GRID_SIZE - 2));
+        if (!canPlaceSingle(state.grid, x, y)) continue;
+        const prev = state.grid[y][x];
+        state.grid[y][x] = CELL_SINGLE;
+        ensureOpenings(state.grid);
+        if (hasPath(state.grid)) {
+          const score = evaluateGridForAi(state.grid, state.special, state.neutralSpecials, null, state.aiWeights, state.baseGrid);
+          state.grid[y][x] = prev;
+          ensureOpenings(state.grid);
+          return { type: "single", x, y, score };
+        }
+        state.grid[y][x] = prev;
+        ensureOpenings(state.grid);
+      }
+    }
+    return null;
+  }
+
+  function applyBlockPlacement(state, chosen) {
+    const { x, y } = chosen;
+    if (chosen.type === "wall") {
+      placeBlock(state.grid, x, y, CELL_PLAYER);
+      state.wallsLeft = Math.max(0, state.wallsLeft - 1);
+    } else if (chosen.type === "single") {
+      state.grid[y][x] = CELL_SINGLE;
+      state.singlesLeft = Math.max(0, state.singlesLeft - 1);
+    }
+    ensureOpenings(state.grid);
+    state.placementOrder.push({
+      type: chosen.type,
+      row: y + 1,
+      column: x + 1,
+      specialHotspots: []
+    });
+    state.placementsMade = (state.placementsMade || 0) + 1;
+  }
+
+  function applySpecialBranch(state, hotspot, hotspotSnapshot) {
+    const { x, y } = hotspot;
+    state.grid[y][x] = CELL_SPECIAL;
+    ensureOpenings(state.grid);
+    state.special.cell = { x, y };
+    state.special.placed = true;
+    state.special.effectTimer = 0;
+    state.special.cooldown = 0;
+    state.special.flashTimer = 0;
+    state.placementOrder.push({
+      type: "special",
+      row: y + 1,
+      column: x + 1,
+      specialHotspots: hotspotSnapshot
+    });
+    return state;
+  }
+
+  let branchCounter = 0;
+
+  function finalizeLayout(state) {
+    if (!state) return null;
+    ensureOpenings(state.grid);
+    reduceMandatorySpeedPads(state.grid, state.special, state.neutralSpecials, 0, state.aiWeights, state.baseGrid);
+    const reclaimStats = reclaimAndReallocateBlocks(state.grid, state.special, state.neutralSpecials, state.placementOrder, state.aiWeights, state.baseGrid, state.rng);
+    state.placementOrder.reallocations = reclaimStats.reallocated || 0;
+    state.placementOrder.reallocationPasses = reclaimStats.passes || 0;
+    annotatePlacementImpacts(state.grid, state.special, state.neutralSpecials, state.placementOrder);
+    const counter = state.branchCounter || { value: 0 };
+    const branchId = ++counter.value;
+    state.branchCounter = counter;
+    const branchPlacementIndex = state.branchPlacementIndex ?? null;
     const profile = {
-      totalMs: +(Date.now() - t0).toFixed(2),
+      totalMs: 0,
       placementMs: 0,
       specialMs: 0,
       reclaimMs: 0,
       lookaheadUsed: 0,
-      placements: placementOrder.length,
+      branch: branchPlacementIndex ?? null,
+      placements: state.placementOrder.length,
       source: "ai-core"
     };
+    const simulatedTime = simulateRunnerTime(state.grid, state.special, state.neutralSpecials);
+    const lookaheadUsed = profile.lookaheadUsed || 0;
+    return {
+      grid: state.grid,
+      special: state.special,
+      placementOrder: state.placementOrder,
+      profile,
+      simulatedTime,
+      branchId,
+      branch: branchPlacementIndex ?? null,
+      branchPlacementIndex,
+      branchTotal: counter.value,
+      lookaheadUsed
+    };
+  }
 
-    return { grid, special, placementOrder, profile, lookaheadUsed: 0 };
+  function cloneState(state) {
+    if (!state) return null;
+    return {
+      grid: cloneGrid(state.grid),
+      special: cloneSpecial(state.special),
+      neutralSpecials: cloneNeutralSpecials(state.neutralSpecials),
+      wallsLeft: state.wallsLeft,
+      singlesLeft: state.singlesLeft,
+      aiWeights: state.aiWeights,
+      baseGrid: state.baseGrid,
+      rng: state.rng,
+      placementOrder: state.placementOrder.map((entry) => ({ ...entry })),
+      specialsOverride: state.specialsOverride,
+      branchPlacementIndex: state.branchPlacementIndex,
+      branchCounter: state.branchCounter
+      ,
+      initialPlacements: state.initialPlacements,
+      placementsMade: state.placementsMade
+    };
   }
 
   // Timing / prediction
@@ -2642,3 +2703,4 @@
     optimizeBlockReallocation
   };
 })(typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : globalThis);
+
