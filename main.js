@@ -3063,7 +3063,7 @@ function recordResult(runner, time) {
 function decideWinner() {
   const player = state.results.player;
   const ai = state.results.ai;
-  const oppLabel = state.vs.active ? state.vs.oppLabel || "Foe" : "AI";
+  const oppLabel = getOpponentLabel();
   if (player == null && ai == null) {
     state.results.winner = "No valid runs";
   } else if (player == null) {
@@ -3462,6 +3462,10 @@ function updateCurrencySelection(forceDisabled = false) {
   }
 }
 
+function getOpponentLabel() {
+  return state.vs.oppLabel || (state.vs.active ? "Foe" : "AI");
+}
+
 function formatScoreText() {
   const finished = !!(state.race && state.race.finished);
   const formatVal = (val) => {
@@ -3470,7 +3474,7 @@ function formatScoreText() {
   };
   const playerText = formatVal(state.results.player);
   const foeText = formatVal(state.results.ai);
-  const oppLabel = state.vs.active ? "Foe" : "AI";
+  const oppLabel = getOpponentLabel();
   return `Score: You ${playerText} | ${oppLabel} ${foeText}`;
 }
 
@@ -4091,9 +4095,10 @@ function hidePopup() {
 function showResultPopup() {
   if (!state.results.winner) return;
   const { player, ai, winner } = state.results;
-  let emoji = "😐";
+  const oppLabel = getOpponentLabel();
+  let emoji = "🙂";
   if (winner.includes("You")) emoji = "😄";
-  else if (winner.includes("AI")) emoji = "😢";
+  else if (winner.includes(oppLabel)) emoji = "😞";
   let detail = "";
   if (player != null && ai != null) {
     const diff = Math.abs(player - ai).toFixed(2);
@@ -4101,7 +4106,6 @@ function showResultPopup() {
   } else {
     detail = winner;
   }
-  const oppLabel = state.vs.active ? state.vs.oppLabel || "Foe" : "AI";
   const html = `${detail}<br><span class="popup-detail">You: ${
     player == null ? "DNF" : player.toFixed(2)
   }s &nbsp;|&nbsp; ${oppLabel}: ${ai == null ? "DNF" : ai.toFixed(2)}s</span>`;
