@@ -1560,7 +1560,7 @@ function vsSendRematch(choice) {
 function updateVsChoiceStatus() {
   if (!vsChoiceStatus) return;
   const self = state.vs.choiceSelf ? `You: ${state.vs.choiceSelf}` : "You: -";
-  const peer = state.vs.choicePeer ? `Foe: ${state.vs.choicePeer}` : "Foe: -";
+  const peer = state.vs.choicePeer ? `Peer: ${state.vs.choicePeer}` : "Peer: -";
   vsChoiceStatus.textContent = `${self} | ${peer}`;
 }
 
