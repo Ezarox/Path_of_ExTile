@@ -809,12 +809,6 @@ function handleVsEvent(evt) {
     return;
   }
   if (evt.type === "rematch") {
-    if (evt.choice === "early-start" || evt.choice === "early-start-cancel") {
-      state.vs.earlyStartPeer = evt.choice === "early-start";
-      updateEarlyStartControls();
-      maybeTriggerEarlyStart();
-      return;
-    }
     state.vs.choicePeer = evt.choice || null;
     updateVsChoiceStatus();
     checkVsChoiceReady();
@@ -1510,8 +1504,7 @@ function toggleEarlyStartVote() {
 
 function sendEarlyStartVote(vote) {
   if (!state.vs.room) return;
-  const choice = vote ? "early-start" : "early-start-cancel";
-  vsSend({ type: "rematch", room: state.vs.room, choice });
+  vsSend({ type: "early-start", room: state.vs.room, vote: !!vote });
 }
 
 function maybeTriggerEarlyStart() {

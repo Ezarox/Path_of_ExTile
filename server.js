@@ -104,6 +104,12 @@ wss.on("connection", (ws) => {
       });
       return;
     }
+    if (type === "early-start") {
+      rooms[currentRoom].players.forEach((p) => {
+        if (p !== ws) send(p, { type: "early-start", vote: !!msg.vote });
+      });
+      return;
+    }
     if (type === "rematch") {
       rooms[currentRoom].players.forEach((p) => {
         if (p !== ws) send(p, { type: "rematch", choice: msg.choice });
